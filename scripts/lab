@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import base64
 import copy
 import csv
 import datetime as dt
@@ -12,11 +13,14 @@ import re
 import shlex
 import signal
 import socket
+import struct
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
+import zlib
 from pathlib import Path
 
 
@@ -70,10 +74,32 @@ def now_stamp():
     return dt.datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
+def deep_merge(base, overlay):
+    merged = copy.deepcopy(base)
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = deep_merge(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
 def load_config(path):
-    with open(path, "r", encoding="utf-8") as handle:
+    config_path = Path(path).expanduser().resolve()
+    with open(config_path, "r", encoding="utf-8") as handle:
         cfg = json.load(handle)
-    cfg["_config_path"] = str(Path(path).resolve())
+    configured_overlay = os.environ.get("LOCAL_AI_LAB_LOCAL_CONFIG")
+    local_config_path = (
+        Path(configured_overlay).expanduser().resolve()
+        if configured_overlay
+        else config_path.with_name("lab.local.json")
+    )
+    if local_config_path.exists():
+        with open(local_config_path, "r", encoding="utf-8") as handle:
+            overlay = json.load(handle)
+        cfg = deep_merge(cfg, overlay)
+        cfg["_local_config_path"] = str(local_config_path)
+    cfg["_config_path"] = str(config_path)
     return cfg
 
 
@@ -343,8 +369,11 @@ def render_presets(cfg):
 
     for model_id in sorted(cfg.get("models", {})):
         entry = model_entry(cfg, model_id)
+        if entry.get("status") == "retired":
+            continue
         lines.extend(["", f"[{model_id}]", f"model = {model_path(cfg, model_id)}"])
         for key, value in entry.get("preset", {}).items():
+            value = expand_value(value, cfg)
             lines.append(f"{key} = {bool_ini(value)}")
 
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -431,6 +460,7 @@ def command_to_string(command):
 
 
 def cmd_doctor(args, cfg):
+    validate_catalog_config(cfg)
     checks = [
         ("python", sys.executable),
         ("llama-server", cfg.get("server", {}).get("binary", "llama-server")),
@@ -439,6 +469,8 @@ def cmd_doctor(args, cfg):
     hf = hf_binary()
     print(f"repo: {REPO_ROOT}")
     print(f"config: {cfg['_config_path']}")
+    if cfg.get("_local_config_path"):
+        print(f"local config: {cfg['_local_config_path']}")
     for label, binary in checks:
         found = which(binary) if label != "python" else binary
         status = found or "missing"
@@ -468,8 +500,197 @@ def cmd_models_config(args, cfg):
         print(f"  {model_id}: exists={exists} path={path}")
 
 
+def model_weight_paths(cfg, model_id):
+    entry = model_entry(cfg, model_id)
+    configured_files = entry.get("files") or []
+    explicit = entry.get("path")
+    if explicit and configured_files:
+        first_path = model_path(cfg, model_id)
+        return [first_path.parent / Path(filename).name for filename in configured_files]
+    if configured_files:
+        return [model_local_dir(cfg, model_id) / filename for filename in configured_files]
+    return [model_path(cfg, model_id)]
+
+
+CATALOG_REQUIRED_FIELDS = {
+    "release_date",
+    "official_model_id",
+    "architecture",
+    "parameters_total_b",
+    "parameters_active_b",
+    "quantization",
+    "license",
+    "roles",
+    "status",
+    "expected_disk_gib",
+    "context_tokens",
+    "source_url",
+    "last_verified",
+    "agent_compatibility",
+}
+
+
+def validate_catalog_config(cfg):
+    errors = []
+    for section in ["models", "watchlist"]:
+        for model_id, entry in cfg.get(section, {}).items():
+            missing = sorted(CATALOG_REQUIRED_FIELDS - set(entry))
+            if missing:
+                errors.append(f"{model_id}: missing {', '.join(missing)}")
+            if entry.get("status") not in {"core", "candidate", "retired", "watch"}:
+                errors.append(f"{model_id}: invalid lifecycle status {entry.get('status')!r}")
+            if not isinstance(entry.get("roles"), list):
+                errors.append(f"{model_id}: roles must be a list")
+            if not isinstance(entry.get("agent_compatibility"), dict):
+                errors.append(f"{model_id}: agent_compatibility must be an object")
+            if section == "models":
+                preset_context = entry.get("preset", {}).get("ctx-size")
+                if preset_context != entry.get("context_tokens"):
+                    errors.append(
+                        f"{model_id}: context_tokens {entry.get('context_tokens')} "
+                        f"does not match preset ctx-size {preset_context}"
+                    )
+    if errors:
+        raise LabError("Invalid model catalog:\n  " + "\n  ".join(errors))
+
+
+def catalog_rows(cfg, role=None, status=None):
+    entries = {}
+    for model_id, entry in cfg.get("models", {}).items():
+        entries[model_id] = (entry, True)
+    for model_id, entry in cfg.get("watchlist", {}).items():
+        entries[model_id] = (entry, False)
+
+    rows = []
+    for model_id, (entry, runnable) in sorted(entries.items()):
+        roles = entry.get("roles", [])
+        if role and role not in roles:
+            continue
+        if status and entry.get("status") != status:
+            continue
+        files = model_weight_paths(cfg, model_id) if runnable else []
+        installed = bool(files) and all(path.exists() for path in files)
+        installed_bytes = sum(path.stat().st_size for path in files if path.exists())
+        partial_bytes = 0
+        if runnable:
+            local_dir = model_local_dir(cfg, model_id)
+            if local_dir.exists():
+                partial_bytes = sum(
+                    path.stat().st_size
+                    for path in local_dir.glob(".cache/**/*.incomplete")
+                    if path.is_file()
+                )
+        rows.append({
+            "model": model_id,
+            "status": entry.get("status", "candidate"),
+            "roles": roles,
+            "quantization": entry.get("quantization"),
+            "license": entry.get("license"),
+            "parameters_total_b": entry.get("parameters_total_b"),
+            "parameters_active_b": entry.get("parameters_active_b"),
+            "context_tokens": entry.get("context_tokens"),
+            "expected_disk_gib": entry.get("expected_disk_gib"),
+            "installed": installed,
+            "installed_gib": round(installed_bytes / (1024 ** 3), 2) if installed_bytes else 0,
+            "partial_gib": round(partial_bytes / (1024 ** 3), 2) if partial_bytes else 0,
+            "last_verified": entry.get("last_verified"),
+            "official_model_id": entry.get("official_model_id"),
+            "source_url": entry.get("source_url"),
+            "agent_compatibility": entry.get("agent_compatibility", {}),
+        })
+    return rows
+
+
+def installed_fleet_gib(cfg):
+    return sum(
+        row["installed_gib"] + row["partial_gib"]
+        for row in catalog_rows(cfg)
+        if row["status"] in {"core", "candidate"}
+    )
+
+
+def cmd_catalog(args, cfg):
+    validate_catalog_config(cfg)
+    rows = catalog_rows(cfg, role=args.role, status=args.status)
+    if args.format == "json":
+        print(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        print("No catalog entries matched the requested filters.")
+        return
+    headers = ["MODEL", "STATUS", "ROLES", "QUANT", "PARAMS", "DISK", "INSTALLED", "VERIFIED"]
+    table_rows = []
+    for row in rows:
+        total = row["parameters_total_b"]
+        active = row["parameters_active_b"]
+        params = "?"
+        if total is not None:
+            params = f"{total:g}B"
+            if active is not None and active != total:
+                params += f"/{active:g}B active"
+        expected = row["expected_disk_gib"]
+        disk = f"{expected:g} GiB" if expected is not None else "?"
+        if row["installed"]:
+            installed = f"yes ({row['installed_gib']:g} GiB)"
+        elif row["partial_gib"]:
+            installed = f"partial ({row['partial_gib']:g} GiB)"
+        else:
+            installed = "no"
+        table_rows.append([
+            row["model"],
+            row["status"],
+            ",".join(row["roles"]) or "-",
+            row["quantization"] or "-",
+            params,
+            disk,
+            installed,
+            row["last_verified"] or "-",
+        ])
+    widths = [
+        max(len(str(value)) for value in [header] + [row[index] for row in table_rows])
+        for index, header in enumerate(headers)
+    ]
+    print("  ".join(header.ljust(widths[index]) for index, header in enumerate(headers)))
+    print("  ".join("-" * width for width in widths))
+    for row in table_rows:
+        print("  ".join(str(value).ljust(widths[index]) for index, value in enumerate(row)))
+    cap = cfg.get("fleet", {}).get("installed_weight_cap_gib")
+    if cap is not None and not args.role and not args.status:
+        print(f"\nInstalled core/candidate weights: {installed_fleet_gib(cfg):g} / {cap:g} GiB")
+
+
+def validate_pull_capacity(cfg, model_ids):
+    cap = cfg.get("fleet", {}).get("installed_weight_cap_gib")
+    if cap is None:
+        return
+    projected = installed_fleet_gib(cfg)
+    rows = {row["model"]: row for row in catalog_rows(cfg)}
+    for model_id in model_ids:
+        row = rows[model_id]
+        if not row["installed"]:
+            expected = row.get("expected_disk_gib")
+            if expected is None:
+                raise LabError(
+                    f"Cannot enforce the {cap:g} GiB fleet cap for {model_id}; "
+                    "expected_disk_gib is missing."
+                )
+            downloaded = row["installed_gib"] + row["partial_gib"]
+            projected += max(0, expected - downloaded)
+    if projected > cap:
+        raise LabError(
+            f"Pull would project {projected:.1f} GiB of core/candidate weights, "
+            f"above the {cap:g} GiB fleet cap. Retire or trash a superseded "
+            "model before downloading."
+        )
+
+
 def pull_one(cfg, model_id, dry_run=False, force=False):
     entry = model_entry(cfg, model_id)
+    if entry.get("status") == "retired":
+        raise LabError(
+            f"{model_id} is retired. Change its lifecycle status before "
+            "re-downloading it."
+        )
     if not entry.get("repo_id"):
         print(f"{model_id}: local-only model, skipping pull")
         return
@@ -500,9 +721,13 @@ def pull_one(cfg, model_id, dry_run=False, force=False):
 
 def cmd_pull(args, cfg):
     if args.selector == "all":
-        model_ids = sorted(cfg.get("models", {}))
+        raise LabError(
+            "Bulk pull-all is disabled. Download explicit aliases in small, "
+            "medium, and flagship waves."
+        )
     else:
         model_ids = selector_models(cfg, args.selector, all_candidates=args.all_candidates)
+    validate_pull_capacity(cfg, model_ids)
     for model_id in model_ids:
         pull_one(cfg, model_id, dry_run=args.dry_run, force=args.force)
 
@@ -927,6 +1152,86 @@ def effective_idle_from_command(cfg):
         return None
 
 
+def process_tree_rss_gib(pid, model_id=None):
+    if not pid or not pid_running(pid):
+        return None
+    result = subprocess.run(
+        ["ps", "-axo", "pid=,ppid=,rss=,command="],
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        return None
+    processes = {}
+    children = {}
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(maxsplit=3)
+        if len(parts) < 3:
+            continue
+        try:
+            process_pid = int(parts[0])
+            parent_pid = int(parts[1])
+            rss_kib = int(parts[2])
+        except ValueError:
+            continue
+        command = parts[3] if len(parts) == 4 else ""
+        processes[process_pid] = {"rss_kib": rss_kib, "command": command}
+        children.setdefault(parent_pid, []).append(process_pid)
+    if pid not in processes:
+        return None
+
+    selected = {pid}
+    pending = [pid]
+    while pending:
+        parent = pending.pop()
+        for child in children.get(parent, []):
+            if child not in selected:
+                selected.add(child)
+                pending.append(child)
+    if model_id:
+        alias_pattern = re.compile(
+            rf"(?:^|\s)--alias\s+{re.escape(model_id)}(?:\s|$)"
+        )
+        workers = {
+            process_pid
+            for process_pid in selected
+            if alias_pattern.search(processes[process_pid]["command"])
+        }
+        if workers:
+            selected = workers
+    rss_kib = sum(processes[process_pid]["rss_kib"] for process_pid in selected)
+    return rss_kib / (1024 ** 2)
+
+
+def run_with_server_memory_sample(cfg, operation, model_id=None, interval_seconds=0.25):
+    pid = read_pid(cfg)
+    samples = []
+    stop = threading.Event()
+
+    def sample():
+        while not stop.is_set():
+            value = process_tree_rss_gib(pid, model_id=model_id)
+            if value is not None:
+                samples.append(value)
+            stop.wait(interval_seconds)
+
+    thread = None
+    if pid and pid_running(pid):
+        thread = threading.Thread(target=sample, daemon=True)
+        thread.start()
+    try:
+        result = operation()
+    finally:
+        stop.set()
+        if thread:
+            thread.join(timeout=max(1, interval_seconds * 2))
+        value = process_tree_rss_gib(pid, model_id=model_id)
+        if value is not None:
+            samples.append(value)
+    peak = round(max(samples), 3) if samples else None
+    return result, peak
+
+
 def collect_status(cfg):
     state = load_service_state()
     pid = read_pid(cfg)
@@ -1074,6 +1379,8 @@ def wait_for_loaded(cfg, model_id, timeout=900):
 
 
 def switch_to_model(cfg, model_id, timeout=900):
+    if model_entry(cfg, model_id).get("status") == "retired":
+        raise LabError(f"{model_id} is retired and cannot be loaded.")
     path = model_path(cfg, model_id)
     if not path.exists():
         raise LabError(f"model file does not exist for {model_id}: {path}. Pull it first with './scripts/lab pull {model_id}'.")
@@ -1182,6 +1489,364 @@ def cmd_chat(args, cfg):
     print(json.dumps(response, indent=2))
 
 
+VERIFY_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "echo",
+        "description": "Return the supplied value unchanged.",
+        "parameters": {
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+            "required": ["value"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+def streaming_json_events(url, payload, timeout=300):
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            for raw_line in response:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if not data or data == "[DONE]":
+                    continue
+                try:
+                    yield json.loads(data)
+                except json.JSONDecodeError as exc:
+                    raise LabError(f"Streaming endpoint returned invalid JSON event: {data}") from exc
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise LabHttpError("POST", url, exc.code, body) from exc
+
+
+def parse_tool_arguments(arguments):
+    if isinstance(arguments, dict):
+        return arguments
+    if not isinstance(arguments, str) or not arguments.strip():
+        raise LabError("Tool call returned empty arguments.")
+    try:
+        parsed = json.loads(arguments)
+    except json.JSONDecodeError as exc:
+        raise LabError(f"Tool call returned malformed arguments: {arguments}") from exc
+    if not isinstance(parsed, dict):
+        raise LabError("Tool call arguments must decode to a JSON object.")
+    return parsed
+
+
+def validate_echo_tool_call(tool_calls):
+    if not isinstance(tool_calls, list) or not tool_calls:
+        raise LabError("Model did not return a structured tool call.")
+    for call in tool_calls:
+        function = call.get("function") or {}
+        if function.get("name") != "echo":
+            continue
+        arguments = parse_tool_arguments(function.get("arguments"))
+        if arguments.get("value") == "verify-model":
+            return
+    raise LabError("Model did not call echo with the required verify-model value.")
+
+
+def non_streaming_tool_check(cfg, model_id, timeout):
+    payload = {
+        "model": model_id,
+        "messages": [{
+            "role": "user",
+            "content": "Call the echo tool once with value verify-model. Do not answer directly.",
+        }],
+        "tools": [VERIFY_TOOL],
+        "tool_choice": "required",
+        "temperature": 0,
+        "max_tokens": 1024,
+    }
+    response = json_request(
+        "POST",
+        f"{api_base(cfg)}/v1/chat/completions",
+        payload,
+        timeout=timeout,
+    )
+    choices = response.get("choices") or []
+    message = (choices[0].get("message") or {}) if choices else {}
+    validate_echo_tool_call(message.get("tool_calls"))
+    return {
+        "finish_reason": choices[0].get("finish_reason") if choices else None,
+        "usage": response.get("usage"),
+    }
+
+
+def streaming_tool_check(cfg, model_id, timeout):
+    payload = {
+        "model": model_id,
+        "messages": [{
+            "role": "user",
+            "content": "Call the echo tool once with value verify-model. Do not answer directly.",
+        }],
+        "tools": [VERIFY_TOOL],
+        "tool_choice": "required",
+        "temperature": 0,
+        "max_tokens": 1024,
+        "stream": True,
+    }
+    assembled = {}
+    saw_delta_tool_calls = False
+    finish_reasons = []
+    for event in streaming_json_events(
+        f"{api_base(cfg)}/v1/chat/completions",
+        payload,
+        timeout=timeout,
+    ):
+        for choice in event.get("choices") or []:
+            if choice.get("finish_reason"):
+                finish_reasons.append(choice["finish_reason"])
+            delta = choice.get("delta") or {}
+            tool_calls = delta.get("tool_calls") or []
+            if tool_calls:
+                saw_delta_tool_calls = True
+            for call in tool_calls:
+                index = call.get("index", 0)
+                current = assembled.setdefault(index, {
+                    "id": "",
+                    "type": "function",
+                    "function": {"name": "", "arguments": ""},
+                })
+                if call.get("id"):
+                    current["id"] += call["id"]
+                function = call.get("function") or {}
+                if function.get("name"):
+                    current["function"]["name"] += function["name"]
+                if function.get("arguments"):
+                    current["function"]["arguments"] += function["arguments"]
+    if not saw_delta_tool_calls:
+        raise LabError("Streaming response never emitted delta.tool_calls.")
+    validate_echo_tool_call([assembled[index] for index in sorted(assembled)])
+    return {"finish_reasons": finish_reasons, "delta_tool_calls": True}
+
+
+def red_square_data_url(size=32):
+    def chunk(kind, data):
+        return (
+            struct.pack(">I", len(data))
+            + kind
+            + data
+            + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+        )
+
+    row = b"\x00" + (b"\xff\x00\x00" * size)
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(row * size))
+        + chunk(b"IEND", b"")
+    )
+    return "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+
+
+def multimodal_check(cfg, model_id, timeout):
+    payload = {
+        "model": model_id,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "What is the dominant color of this square? Answer with one color word.",
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {"url": red_square_data_url()},
+                },
+            ],
+        }],
+        "temperature": 0,
+        "max_tokens": 128,
+    }
+    response = json_request(
+        "POST",
+        f"{api_base(cfg)}/v1/chat/completions",
+        payload,
+        timeout=timeout,
+    )
+    choices = response.get("choices") or []
+    message = (choices[0].get("message") or {}) if choices else {}
+    content = message.get("content") or ""
+    if not isinstance(content, str) or "red" not in content.lower():
+        raise LabError(
+            "Multimodal check did not identify the red square: "
+            + str(content)[:200]
+        )
+    return {"response": content}
+
+
+def restore_model_state(cfg, previous_non_embedding, previous_manual_unloaded, timeout):
+    if previous_manual_unloaded or not previous_non_embedding:
+        for model_id in active_model_ids(cfg, include_embeddings=False, timeout=10):
+            unload_model(cfg, model_id, quiet=True)
+            wait_for_inactive(cfg, model_id, timeout=timeout)
+        update_service_state(manual_unloaded=previous_manual_unloaded)
+        return
+    switch_to_model(cfg, previous_non_embedding[0], timeout=timeout)
+    update_service_state(manual_unloaded=False)
+
+
+def cmd_verify(args, cfg):
+    model_id = resolve_selector(cfg, args.selector)
+    if is_embedding_model(cfg, model_id):
+        raise LabError("verify currently exercises chat and tool calls; use it with a non-embedding model.")
+    model_files = model_weight_paths(cfg, model_id)
+    missing = [path for path in model_files if not path.exists()]
+    if missing:
+        raise LabError(
+            "Model preflight failed; missing files:\n"
+            + "\n".join(f"  {path}" for path in missing)
+        )
+
+    state = load_service_state()
+    previous_non_embedding = []
+    if api_is_ready(cfg):
+        previous_non_embedding = active_model_ids(
+            cfg,
+            include_embeddings=False,
+            timeout=10,
+        )
+    update_service_state(manual_unloaded=False)
+    out_dir = paths(cfg)["results_dir"] / f"{now_stamp()}-verify-{model_id}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    checks = {
+        "file_preflight": {"passed": True, "files": len(model_files)},
+        "load": {"passed": False},
+        "completion": {"passed": False},
+        "non_streaming_tools": {"passed": False},
+        "streaming_tools": {"passed": False},
+        "multimodal": {"passed": True, "skipped": True},
+        "residency": {"passed": False},
+        "unload_or_restore": {"passed": False},
+    }
+    failure = None
+    started = time.perf_counter()
+    try:
+        if not api_is_ready(cfg):
+            if LAUNCH_AGENT_PATH.exists():
+                bootstrap_service(cfg, wait=args.timeout)
+            else:
+                raise LabError(
+                    "Local AI server is offline. Run 'make start' or "
+                    "'make service-install' first."
+                )
+        load_response = switch_to_model(cfg, model_id, timeout=args.timeout)
+        checks["load"] = {"passed": True, "response": load_response}
+
+        completion = local_chat_completion(
+            cfg,
+            model_id,
+            {
+                "messages": [{
+                    "role": "user",
+                    "content": "Reply with exactly VERIFY_OK and nothing else.",
+                }],
+                "max_tokens": 1024,
+                "temperature": 0,
+            },
+            1024,
+            0,
+            args.timeout,
+        )
+        if "VERIFY_OK" not in completion["text"]:
+            raise LabError(
+                "Completion check did not contain VERIFY_OK: "
+                + completion["text"][:200]
+            )
+        checks["completion"] = {
+            "passed": True,
+            "latency_seconds": completion["latency_seconds"],
+            "completion_tokens_per_second": completion["completion_tokens_per_second"],
+        }
+
+        checks["non_streaming_tools"] = {
+            "passed": True,
+            **non_streaming_tool_check(cfg, model_id, args.timeout),
+        }
+        checks["streaming_tools"] = {
+            "passed": True,
+            **streaming_tool_check(cfg, model_id, args.timeout),
+        }
+        if model_entry(cfg, model_id).get("preset", {}).get("mmproj"):
+            checks["multimodal"] = {
+                "passed": True,
+                "skipped": False,
+                **multimodal_check(cfg, model_id, args.timeout),
+            }
+
+        active = active_model_ids(cfg, include_embeddings=False, timeout=10)
+        if active != [model_id]:
+            raise LabError(
+                f"Residency check expected only {model_id}; active models were {active}."
+            )
+        all_active = active_model_ids(
+            cfg,
+            include_embeddings=True,
+            timeout=10,
+        )
+        checks["residency"] = {
+            "passed": True,
+            "non_embedding_models": active,
+            "embedding_models": [
+                active_model
+                for active_model in all_active
+                if is_embedding_model(cfg, active_model)
+            ],
+        }
+    except Exception as exc:
+        failure = str(exc)
+    finally:
+        try:
+            if args.keep_loaded and failure is None:
+                update_service_state(manual_unloaded=False)
+            else:
+                restore_model_state(
+                    cfg,
+                    previous_non_embedding,
+                    state["manual_unloaded"],
+                    args.timeout,
+                )
+            checks["unload_or_restore"] = {"passed": True}
+        except Exception as restore_exc:
+            checks["unload_or_restore"] = {
+                "passed": False,
+                "error": str(restore_exc),
+            }
+            if failure is None:
+                failure = f"State restoration failed: {restore_exc}"
+
+    result = {
+        "schema_version": 1,
+        "model": model_id,
+        "passed": failure is None and all(check["passed"] for check in checks.values()),
+        "elapsed_seconds": round(time.perf_counter() - started, 3),
+        "checks": checks,
+        "error": failure,
+    }
+    write_metadata(cfg, out_dir, "verify", extra={
+        "model": benchmark_model_metadata(cfg, model_id),
+    })
+    (out_dir / "verification.json").write_text(
+        json.dumps(result, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(json.dumps(result, indent=2))
+    print(f"results: {out_dir}")
+    if not result["passed"]:
+        raise LabError(f"Verification failed for {model_id}: {failure}")
+
+
 BENCH_FLAG_MAP = {
     "n-gpu-layers": "--n-gpu-layers",
     "n-cpu-moe": "--n-cpu-moe",
@@ -1205,6 +1870,34 @@ def merged_preset(cfg, model_id):
     return merged
 
 
+def benchmark_model_metadata(cfg, model_id):
+    entry = model_entry(cfg, model_id)
+    return {
+        "model": model_id,
+        "official_model_id": entry.get("official_model_id"),
+        "release_date": entry.get("release_date"),
+        "quantization": entry.get("quantization"),
+        "context_tokens": entry.get("context_tokens"),
+        "last_verified": entry.get("last_verified"),
+        "license": entry.get("license"),
+    }
+
+
+def runtime_version(cfg):
+    binary = cfg.get("server", {}).get("binary", "llama-server")
+    try:
+        result = subprocess.run(
+            [binary, "--version"],
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    value = (result.stdout or result.stderr).strip()
+    return value or None
+
+
 def write_metadata(cfg, out_dir, command_kind, extra=None):
     meta = {
         "created_at": dt.datetime.now().isoformat(),
@@ -1212,6 +1905,10 @@ def write_metadata(cfg, out_dir, command_kind, extra=None):
         "repo": str(REPO_ROOT),
         "config": cfg["_config_path"],
         "config_hash": config_hash(cfg),
+        "runtime": {
+            "name": cfg.get("fleet", {}).get("primary_runtime", "llama.cpp"),
+            "version": runtime_version(cfg),
+        },
         "platform": {
             "system": platform.system(),
             "release": platform.release(),
@@ -1237,7 +1934,9 @@ def cmd_bench_llama(args, cfg):
     model_ids = require_model_files(cfg, model_ids, args.selector, skip_missing=args.skip_missing)
     out_dir = paths(cfg)["results_dir"] / f"{now_stamp()}-llama-bench-{args.selector}"
     out_dir.mkdir(parents=True, exist_ok=True)
-    write_metadata(cfg, out_dir, "llama-bench")
+    write_metadata(cfg, out_dir, "llama-bench", extra={
+        "models": [benchmark_model_metadata(cfg, model_id) for model_id in model_ids],
+    })
 
     bench_cfg = cfg.get("benchmarks", {})
     repetitions = args.repetitions or bench_cfg.get("repetitions", 3)
@@ -1316,11 +2015,17 @@ def summarize_server_results(rows):
     for model, items in grouped.items():
         latencies = [item["latency_seconds"] for item in items]
         toks = [item["completion_tokens_per_second"] for item in items if item.get("completion_tokens_per_second")]
+        memory = [
+            item["model_worker_peak_rss_gib"]
+            for item in items
+            if item.get("model_worker_peak_rss_gib") is not None
+        ]
         summary.append({
             "model": model,
             "requests": len(items),
             "avg_latency_seconds": round(sum(latencies) / len(latencies), 3) if latencies else None,
             "avg_completion_tokens_per_second": round(sum(toks) / len(toks), 3) if toks else None,
+            "peak_model_worker_rss_gib": round(max(memory), 3) if memory else None,
         })
     return summary
 
@@ -1342,7 +2047,9 @@ def cmd_bench_server(args, cfg):
     repetitions = args.repetitions or cfg.get("benchmarks", {}).get("server_repetitions", 2)
     out_dir = paths(cfg)["results_dir"] / f"{now_stamp()}-server-{args.selector}"
     out_dir.mkdir(parents=True, exist_ok=True)
-    write_metadata(cfg, out_dir, "server")
+    write_metadata(cfg, out_dir, "server", extra={
+        "models": [benchmark_model_metadata(cfg, model_id) for model_id in model_ids],
+    })
 
     result_path = out_dir / "results.jsonl"
     rows = []
@@ -1367,7 +2074,16 @@ def cmd_bench_server(args, cfg):
                         "repetition": rep + 1,
                     }
                     try:
-                        response = json_request("POST", f"{api_base(cfg)}/v1/chat/completions", payload, timeout=args.timeout)
+                        response, model_worker_peak_rss_gib = run_with_server_memory_sample(
+                            cfg,
+                            lambda: json_request(
+                                "POST",
+                                f"{api_base(cfg)}/v1/chat/completions",
+                                payload,
+                                timeout=args.timeout,
+                            ),
+                            model_id=model_id,
+                        )
                         latency = time.perf_counter() - started
                         usage = response.get("usage") or {}
                         completion_tokens = usage.get("completion_tokens")
@@ -1377,6 +2093,7 @@ def cmd_bench_server(args, cfg):
                             "completion_tokens": completion_tokens,
                             "total_tokens": usage.get("total_tokens"),
                             "completion_tokens_per_second": round(completion_tokens / latency, 6) if completion_tokens else None,
+                            "model_worker_peak_rss_gib": model_worker_peak_rss_gib,
                         })
                     except Exception as exc:
                         row.update({"latency_seconds": round(time.perf_counter() - started, 6), "error": str(exc)})
@@ -1437,17 +2154,28 @@ def local_chat_completion(cfg, model_id, prompt, max_tokens, temperature, timeou
     payload = {
         "model": model_id,
         "messages": prompt["messages"],
-        "max_tokens": prompt.get("max_tokens", max_tokens),
+        "max_tokens": max_tokens,
         "temperature": prompt.get("temperature", temperature),
     }
     started = time.perf_counter()
-    response = json_request("POST", f"{api_base(cfg)}/v1/chat/completions", payload, timeout=timeout)
+    response, model_worker_peak_rss_gib = run_with_server_memory_sample(
+        cfg,
+        lambda: json_request(
+            "POST",
+            f"{api_base(cfg)}/v1/chat/completions",
+            payload,
+            timeout=timeout,
+        ),
+        model_id=model_id,
+    )
     latency = time.perf_counter() - started
     usage = response.get("usage") or {}
     completion_tokens = usage.get("completion_tokens")
     choices = response.get("choices") or []
     text = ""
+    finish_reason = None
     if choices:
+        finish_reason = choices[0].get("finish_reason")
         message = choices[0].get("message") or {}
         content = message.get("content")
         if isinstance(content, str):
@@ -1462,7 +2190,19 @@ def local_chat_completion(cfg, model_id, prompt, max_tokens, temperature, timeou
         "completion_tokens": completion_tokens,
         "total_tokens": usage.get("total_tokens"),
         "completion_tokens_per_second": round(completion_tokens / latency, 6) if completion_tokens else None,
+        "finish_reason": finish_reason,
+        "model_worker_peak_rss_gib": model_worker_peak_rss_gib,
     }
+
+
+def require_visible_completion(chat):
+    if isinstance(chat.get("text"), str) and chat["text"].strip():
+        return
+    raise LabError(
+        "Model returned no visible answer "
+        f"(finish_reason={chat.get('finish_reason')!r}, "
+        f"completion_tokens={chat.get('completion_tokens')!r})."
+    )
 
 
 def response_output_text(response):
@@ -1478,12 +2218,12 @@ def response_output_text(response):
     return "".join(texts)
 
 
-def openai_judge_config(cfg, args):
+def judge_config(cfg, args):
     judge = cfg.get("benchmarks", {}).get("judge", {})
     return {
-        "provider": args.judge_provider or judge.get("provider", "openai"),
+        "provider": args.judge_provider or judge.get("provider", "manual"),
         "base_url": (args.judge_base_url or judge.get("base_url", "https://api.openai.com/v1")).rstrip("/"),
-        "model": args.judge_model or judge.get("model", "gpt-5.5"),
+        "model": args.judge_model or judge.get("model"),
         "reasoning_effort": args.judge_reasoning_effort or judge.get("reasoning_effort", "low"),
         "timeout_seconds": args.judge_timeout or judge.get("timeout_seconds", 120),
     }
@@ -1493,12 +2233,12 @@ def validate_quality_score(score):
     for key in ["correctness", "completeness", "instruction_following", "clarity", "overall", "confidence"]:
         value = score.get(key)
         if not isinstance(value, int) or value < 1 or value > 5:
-            raise LabError(f"OpenAI judge returned invalid {key} score: {value!r}")
+            raise LabError(f"Judge returned invalid {key} score: {value!r}")
     if not isinstance(score.get("pass"), bool):
-        raise LabError("OpenAI judge returned invalid pass value.")
+        raise LabError("Judge returned invalid pass value.")
     for key in ["strengths", "weaknesses", "missed_requirements"]:
         if not isinstance(score.get(key), list):
-            raise LabError(f"OpenAI judge returned invalid {key} list.")
+            raise LabError(f"Judge returned invalid {key} list.")
 
 
 def require_openai_key():
@@ -1511,6 +2251,8 @@ def require_openai_key():
 def openai_score_response(judge_cfg, eval_payload):
     if judge_cfg["provider"] != "openai":
         raise LabError(f"Unsupported judge provider: {judge_cfg['provider']}")
+    if not judge_cfg.get("model"):
+        raise LabError("--judge-model is required when --judge-provider openai.")
     api_key = require_openai_key()
     payload = {
         "model": judge_cfg["model"],
@@ -1554,6 +2296,82 @@ def openai_score_response(judge_cfg, eval_payload):
     }
 
 
+def extract_json_object(text):
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```(?:json)?\s*", "", stripped)
+        stripped = re.sub(r"\s*```$", "", stripped)
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        start = stripped.find("{")
+        end = stripped.rfind("}")
+        if start < 0 or end <= start:
+            raise LabError(f"Local judge returned invalid JSON: {text[:500]}")
+        try:
+            parsed = json.loads(stripped[start:end + 1])
+        except json.JSONDecodeError as exc:
+            raise LabError(f"Local judge returned invalid JSON: {text[:500]}") from exc
+    if not isinstance(parsed, dict):
+        raise LabError("Local judge returned JSON that was not an object.")
+    return parsed
+
+
+def local_score_response(cfg, judge_cfg, eval_payload):
+    model_id = judge_cfg.get("model")
+    if not model_id:
+        raise LabError("--judge-model is required when --judge-provider local.")
+    resolve_selector(cfg, model_id)
+    switch_to_model(cfg, model_id, timeout=judge_cfg["timeout_seconds"])
+    prompt = {
+        "messages": [
+            {"role": "system", "content": JUDGE_INSTRUCTIONS},
+            {
+                "role": "user",
+                "content": (
+                    "Return only a JSON object matching this JSON Schema:\n"
+                    + json.dumps(QUALITY_SCORE_SCHEMA, ensure_ascii=False)
+                    + "\n\nEvaluation input:\n"
+                    + json.dumps(eval_payload, ensure_ascii=False, indent=2)
+                ),
+            },
+        ],
+        "max_tokens": 1024,
+        "temperature": 0,
+    }
+    result = local_chat_completion(
+        cfg,
+        model_id,
+        prompt,
+        1024,
+        0,
+        judge_cfg["timeout_seconds"],
+    )
+    score = extract_json_object(result["text"])
+    validate_quality_score(score)
+    return {
+        "score": score,
+        "judge_latency_seconds": result["latency_seconds"],
+        "judge_response_id": None,
+        "judge_usage": {
+            "prompt_tokens": result["prompt_tokens"],
+            "completion_tokens": result["completion_tokens"],
+            "total_tokens": result["total_tokens"],
+        },
+    }
+
+
+def score_quality_response(cfg, judge_cfg, eval_payload):
+    provider = judge_cfg["provider"]
+    if provider == "openai":
+        return openai_score_response(judge_cfg, eval_payload)
+    if provider == "local":
+        return local_score_response(cfg, judge_cfg, eval_payload)
+    if provider == "manual":
+        return {}
+    raise LabError(f"Unsupported judge provider: {provider}")
+
+
 def quality_eval_payload(selector, model_id, prompt, candidate_text):
     return {
         "use_case": selector,
@@ -1570,23 +2388,30 @@ def quality_eval_payload(selector, model_id, prompt, candidate_text):
 def summarize_quality_results(rows):
     grouped = {}
     for row in rows:
-        score = row.get("score")
-        if row.get("error") or not score:
+        if row.get("error"):
             continue
         grouped.setdefault(row["model"], []).append(row)
 
     summary = []
     for model, items in grouped.items():
+        judged = [item for item in items if item.get("score")]
+
         def avg_score(name):
-            values = [item["score"][name] for item in items if name in item["score"]]
+            values = [item["score"][name] for item in judged if name in item["score"]]
             return round(sum(values) / len(values), 3) if values else None
 
         latencies = [item["latency_seconds"] for item in items if item.get("latency_seconds") is not None]
         toks = [item["completion_tokens_per_second"] for item in items if item.get("completion_tokens_per_second")]
-        passes = [1 if item["score"].get("pass") else 0 for item in items]
+        memory = [
+            item["model_worker_peak_rss_gib"]
+            for item in items
+            if item.get("model_worker_peak_rss_gib") is not None
+        ]
+        passes = [1 if item["score"].get("pass") else 0 for item in judged]
         summary.append({
             "model": model,
-            "judged": len(items),
+            "responses": len(items),
+            "judged": len(judged),
             "avg_overall": avg_score("overall"),
             "avg_correctness": avg_score("correctness"),
             "avg_completeness": avg_score("completeness"),
@@ -1594,6 +2419,7 @@ def summarize_quality_results(rows):
             "pass_rate": round(sum(passes) / len(passes), 3) if passes else None,
             "avg_latency_seconds": round(sum(latencies) / len(latencies), 3) if latencies else None,
             "avg_completion_tokens_per_second": round(sum(toks) / len(toks), 3) if toks else None,
+            "peak_model_worker_rss_gib": round(max(memory), 3) if memory else None,
         })
     return sorted(summary, key=lambda item: (item.get("avg_overall") or 0, item.get("pass_rate") or 0), reverse=True)
 
@@ -1608,61 +2434,282 @@ def cmd_bench_quality(args, cfg):
     if not prompts:
         raise LabError(f"No chat prompts found in {prompt_path}")
 
-    judge_cfg = openai_judge_config(cfg, args)
-    require_openai_key()
+    judge_cfg = judge_config(cfg, args)
+    if judge_cfg["provider"] == "openai":
+        require_openai_key()
+    if judge_cfg["provider"] == "local":
+        judge_model = judge_cfg.get("model")
+        if not judge_model:
+            raise LabError("--judge-model is required when --judge-provider local.")
+        judge_model = resolve_selector(cfg, judge_model)
+        judge_cfg["model"] = judge_model
+        if judge_model in model_ids:
+            raise LabError("The local judge model must be different from every candidate model.")
     repetitions = args.repetitions or cfg.get("benchmarks", {}).get("quality_repetitions", 1)
     out_dir = paths(cfg)["results_dir"] / f"{now_stamp()}-quality-{args.selector}"
     out_dir.mkdir(parents=True, exist_ok=True)
+    judge_metadata = {"provider": judge_cfg["provider"]}
+    if judge_cfg["provider"] != "manual":
+        judge_metadata.update({
+            key: value
+            for key, value in judge_cfg.items()
+            if key not in {"provider", "api_key"}
+        })
     write_metadata(cfg, out_dir, "quality", extra={
-        "judge": {k: v for k, v in judge_cfg.items() if k != "api_key"},
+        "judge": judge_metadata,
         "prompt_file": str(prompt_path),
-        "models": model_ids,
+        "models": [benchmark_model_metadata(cfg, model_id) for model_id in model_ids],
         "repetitions": repetitions,
     })
 
     rows = []
+    manual_reviews = []
     result_path = out_dir / "results.jsonl"
     with open(result_path, "w", encoding="utf-8") as handle:
         for model_id in model_ids:
-            switch_to_model(cfg, model_id, timeout=args.timeout)
             for prompt in prompts:
                 for rep in range(repetitions):
+                    switch_to_model(cfg, model_id, timeout=args.timeout)
                     row = {
                         "model": model_id,
                         "prompt": prompt.get("name", "unnamed"),
                         "repetition": rep + 1,
                     }
-                    chat = local_chat_completion(cfg, model_id, prompt, args.max_tokens, args.temperature, args.timeout)
-                    row.update({
-                        "latency_seconds": chat["latency_seconds"],
-                        "prompt_tokens": chat["prompt_tokens"],
-                        "completion_tokens": chat["completion_tokens"],
-                        "total_tokens": chat["total_tokens"],
-                        "completion_tokens_per_second": chat["completion_tokens_per_second"],
-                        "answer": chat["text"],
-                    })
                     try:
-                        judge = openai_score_response(judge_cfg, quality_eval_payload(args.selector, model_id, prompt, chat["text"]))
-                        row.update(judge)
+                        chat = local_chat_completion(
+                            cfg,
+                            model_id,
+                            prompt,
+                            args.max_tokens,
+                            args.temperature,
+                            args.timeout,
+                        )
+                        row.update({
+                            "latency_seconds": chat["latency_seconds"],
+                            "prompt_tokens": chat["prompt_tokens"],
+                            "completion_tokens": chat["completion_tokens"],
+                            "total_tokens": chat["total_tokens"],
+                            "completion_tokens_per_second": chat["completion_tokens_per_second"],
+                            "model_worker_peak_rss_gib": chat["model_worker_peak_rss_gib"],
+                            "finish_reason": chat["finish_reason"],
+                            "answer": chat["text"],
+                        })
+                        require_visible_completion(chat)
                     except Exception as exc:
-                        row["judge_error"] = str(exc)
+                        row["error"] = str(exc)
                         rows.append(row)
                         handle.write(json.dumps(row, ensure_ascii=False) + "\n")
                         handle.flush()
-                        raise
+                        print(
+                            f"{model_id}/{row['prompt']} rep={rep + 1}: "
+                            f"failed: {exc}",
+                            flush=True,
+                        )
+                        continue
+                    eval_payload = quality_eval_payload(
+                        args.selector,
+                        model_id,
+                        prompt,
+                        chat["text"],
+                    )
+                    if judge_cfg["provider"] == "manual":
+                        manual_reviews.append({
+                            "model": model_id,
+                            "prompt": row["prompt"],
+                            "repetition": rep + 1,
+                            "evaluation": eval_payload,
+                            "score": {
+                                "correctness": None,
+                                "completeness": None,
+                                "instruction_following": None,
+                                "clarity": None,
+                                "overall": None,
+                                "pass": None,
+                                "confidence": None,
+                                "rationale": "",
+                                "strengths": [],
+                                "weaknesses": [],
+                                "missed_requirements": [],
+                            },
+                        })
+                    else:
+                        try:
+                            row.update(score_quality_response(cfg, judge_cfg, eval_payload))
+                        except Exception as exc:
+                            row["judge_error"] = str(exc)
+                            rows.append(row)
+                            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+                            handle.flush()
+                            raise
                     rows.append(row)
                     handle.write(json.dumps(row, ensure_ascii=False) + "\n")
                     handle.flush()
-                    print(f"{model_id}/{row['prompt']} rep={rep + 1}: overall={row['score']['overall']} pass={row['score']['pass']}", flush=True)
+                    if row.get("score"):
+                        print(
+                            f"{model_id}/{row['prompt']} rep={rep + 1}: "
+                            f"overall={row['score']['overall']} pass={row['score']['pass']}",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"{model_id}/{row['prompt']} rep={rep + 1}: "
+                            "awaiting manual review",
+                            flush=True,
+                        )
 
-            if args.unload_after:
+            if judge_cfg["provider"] == "local":
+                if args.unload_after:
+                    unload_model(cfg, judge_cfg["model"], quiet=True)
+                else:
+                    switch_to_model(cfg, model_id, timeout=args.timeout)
+            elif args.unload_after:
                 unload_model(cfg, model_id, quiet=True)
 
     summary = summarize_quality_results(rows)
+    if manual_reviews:
+        (out_dir / "manual-review.json").write_text(
+            json.dumps(manual_reviews, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     write_summary_csv(out_dir / "summary.csv", summary)
     print(json.dumps(summary, indent=2))
     print(f"results: {out_dir}")
+
+
+PUBLIC_DROP_KEYS = {
+    "answer",
+    "api_key",
+    "candidate_response",
+    "command",
+    "config",
+    "config_hash",
+    "environment",
+    "evaluation",
+    "git_head",
+    "headers",
+    "hostname",
+    "judge_response_id",
+    "missed_requirements",
+    "processor",
+    "platform",
+    "rationale",
+    "repo",
+    "stderr",
+    "stdout",
+    "strengths",
+    "task_messages",
+    "weaknesses",
+}
+
+
+def sanitize_public_string(value):
+    sanitized = redact_secrets(value)
+    home = str(Path.home())
+    replacements = {
+        home: "${HOME}",
+        str(REPO_ROOT): "${REPO}",
+    }
+    for private_value, replacement in replacements.items():
+        sanitized = sanitized.replace(private_value, replacement)
+    sanitized = re.sub(r"/Users/[^/\s\"']+", "${HOME}", sanitized)
+    sanitized = re.sub(r"/home/[^/\s\"']+", "${HOME}", sanitized)
+    sanitized = re.sub(
+        r"(?i)(authorization\s*:\s*bearer\s+)[^\s\"']+",
+        r"\1REDACTED",
+        sanitized,
+    )
+    sanitized = re.sub(
+        r"(?i)(api[_-]?key|token|secret)([\"']?\s*[:=]\s*[\"']?)[^,\s\"']+",
+        r"\1\2REDACTED",
+        sanitized,
+    )
+    return sanitized
+
+
+def sanitize_public_value(value, key=None):
+    normalized_key = key.lower() if isinstance(key, str) else ""
+    if (
+        normalized_key in PUBLIC_DROP_KEYS
+        or normalized_key.endswith("_path")
+        or normalized_key.endswith("_file")
+        or normalized_key.endswith("_command")
+    ):
+        return None
+    if isinstance(value, dict):
+        result = {}
+        for child_key, child_value in value.items():
+            sanitized = sanitize_public_value(child_value, child_key)
+            if sanitized is not None:
+                result[child_key] = sanitized
+        return result
+    if isinstance(value, list):
+        return [
+            sanitized
+            for item in value
+            if (sanitized := sanitize_public_value(item, key)) is not None
+        ]
+    if isinstance(value, str):
+        return sanitize_public_string(value)
+    return value
+
+
+def load_public_source_file(path):
+    if path.suffix == ".json":
+        return json.loads(path.read_text(encoding="utf-8"))
+    if path.suffix == ".jsonl":
+        return read_jsonl(path)
+    if path.suffix == ".csv":
+        with open(path, "r", encoding="utf-8", newline="") as handle:
+            return list(csv.DictReader(handle))
+    raise LabError(f"Unsupported public export source file: {path}")
+
+
+def validate_public_export(payload):
+    serialized = json.dumps(payload, ensure_ascii=False)
+    forbidden = [
+        (r"/Users/[^/\s\"']+", "private user path"),
+        (r"sk-[A-Za-z0-9_*.-]{8,}", "API key"),
+        (r"(?i)authorization\s*:\s*bearer\s+(?!REDACTED)", "bearer token"),
+        (r"(?i)BEGIN (?:RSA |OPENSSH )?PRIVATE KEY", "private key"),
+    ]
+    for pattern, label in forbidden:
+        if re.search(pattern, serialized):
+            raise LabError(f"Public export still contains a {label}.")
+
+
+def cmd_export_public(args, cfg):
+    result_dir = Path(args.result_dir).expanduser().resolve()
+    if not result_dir.is_dir():
+        raise LabError(f"Result directory does not exist: {result_dir}")
+    output_path = Path(args.output).expanduser().resolve()
+    included = {}
+    for name in [
+        "metadata.json",
+        "summary.json",
+        "summary.csv",
+        "verification.json",
+        "results.jsonl",
+        "index.jsonl",
+    ]:
+        source = result_dir / name
+        if source.exists():
+            included[name] = sanitize_public_value(load_public_source_file(source))
+    if not included:
+        raise LabError(f"No supported benchmark artifacts found in {result_dir}")
+    payload = {
+        "schema_version": 1,
+        "exported_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "result_type": (included.get("metadata.json") or {}).get("command_kind"),
+        "artifacts": included,
+    }
+    validate_public_export(payload)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    print(output_path)
 
 
 def build_parser():
@@ -1674,8 +2721,13 @@ def build_parser():
     sub.add_parser("models-config")
     sub.add_parser("presets")
 
+    catalog = sub.add_parser("catalog")
+    catalog.add_argument("--role")
+    catalog.add_argument("--status", choices=["core", "candidate", "retired", "watch"])
+    catalog.add_argument("--format", choices=["text", "json"], default="text")
+
     pull = sub.add_parser("pull")
-    pull.add_argument("selector", help="model alias, use case, or all")
+    pull.add_argument("selector", help="model alias or use case")
     pull.add_argument("--all-candidates", action="store_true", help="when selector is a use case, pull all candidate models")
     pull.add_argument("--dry-run", action="store_true")
     pull.add_argument("--force", action="store_true")
@@ -1742,6 +2794,11 @@ def build_parser():
     chat.add_argument("--temperature", type=float, default=0.2)
     chat.add_argument("--timeout", type=int, default=900)
 
+    verify = sub.add_parser("verify")
+    verify.add_argument("selector")
+    verify.add_argument("--timeout", type=int, default=900)
+    verify.add_argument("--keep-loaded", action="store_true")
+
     bench_llama = sub.add_parser("bench-llama")
     bench_llama.add_argument("selector")
     bench_llama.add_argument("--all-candidates", action="store_true")
@@ -1767,16 +2824,24 @@ def build_parser():
     bench_quality.add_argument("--prompt-file")
     bench_quality.add_argument("--repetitions", type=int)
     bench_quality.add_argument("--limit-prompts", type=int)
-    bench_quality.add_argument("--max-tokens", type=int, default=384)
+    bench_quality.add_argument("--max-tokens", type=int, default=4096)
     bench_quality.add_argument("--temperature", type=float, default=0.2)
     bench_quality.add_argument("--timeout", type=int, default=900)
     bench_quality.add_argument("--unload-after", action="store_true")
     bench_quality.add_argument("--skip-missing", action="store_true")
-    bench_quality.add_argument("--judge-provider", default=None)
+    bench_quality.add_argument(
+        "--judge-provider",
+        choices=["manual", "local", "openai"],
+        default=None,
+    )
     bench_quality.add_argument("--judge-base-url", default=None)
     bench_quality.add_argument("--judge-model", default=None)
     bench_quality.add_argument("--judge-reasoning-effort", default=None)
     bench_quality.add_argument("--judge-timeout", type=int, default=None)
+
+    export_public = sub.add_parser("export-public")
+    export_public.add_argument("result_dir")
+    export_public.add_argument("--output", required=True)
 
     return parser
 
@@ -1784,6 +2849,7 @@ def build_parser():
 COMMANDS = {
     "doctor": cmd_doctor,
     "models-config": cmd_models_config,
+    "catalog": cmd_catalog,
     "pull": cmd_pull,
     "presets": cmd_presets,
     "start": cmd_start,
@@ -1804,9 +2870,11 @@ COMMANDS = {
     "unload": cmd_unload,
     "unload-active": cmd_unload_active,
     "chat": cmd_chat,
+    "verify": cmd_verify,
     "bench-llama": cmd_bench_llama,
     "bench-server": cmd_bench_server,
     "bench-quality": cmd_bench_quality,
+    "export-public": cmd_export_public,
 }
 
 

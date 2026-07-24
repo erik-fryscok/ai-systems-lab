@@ -2,19 +2,22 @@ LAB := ./scripts/lab
 MODEL ?= coder
 USE_CASE ?= coder
 
-.PHONY: doctor presets pull pull-all start stop restart status logs models load switch unload unload-active auto-idle-on auto-idle-off auto-idle-toggle service-install service-start service-stop service-restart service-status service-uninstall chat bench-llama bench-server bench-quality
+.PHONY: doctor test catalog presets pull start stop restart status logs models load switch unload unload-active auto-idle-on auto-idle-off auto-idle-toggle service-install service-start service-stop service-restart service-status service-uninstall chat verify bench-llama bench-server bench-quality
 
 doctor:
 	$(LAB) doctor
+
+test:
+	python3 -m unittest discover -s tests
+
+catalog:
+	$(LAB) catalog
 
 presets:
 	$(LAB) presets
 
 pull:
 	$(LAB) pull $(MODEL)
-
-pull-all:
-	$(LAB) pull all
 
 start:
 	$(LAB) start
@@ -74,6 +77,9 @@ service-uninstall:
 
 chat:
 	$(LAB) chat $(MODEL) "$(PROMPT)"
+
+verify:
+	$(LAB) verify $(MODEL)
 
 bench-llama:
 	$(LAB) bench-llama $(MODEL)

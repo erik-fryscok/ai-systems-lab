@@ -1,0 +1,7 @@
+{
+  "models": {
+    "gpt-oss-120b": {
+      "path": "${home}/path/to/gpt-oss-120b-MXFP4-00001-of-00002.gguf"
+    }
+  }
+}

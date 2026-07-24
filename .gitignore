@@ -5,6 +5,7 @@
 __pycache__/
 *.py[cod]
 config/generated/
+config/lab.local.json
 benchmarks/results/
 *.log
 *.pid

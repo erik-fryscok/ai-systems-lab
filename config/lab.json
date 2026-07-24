@@ -5,6 +5,13 @@
     "generated_dir": "config/generated",
     "results_dir": "benchmarks/results"
   },
+  "fleet": {
+    "installed_weight_cap_gib": 400,
+    "primary_runtime": "llama.cpp",
+    "default_large_context_tokens": 32768,
+    "admission_agents": ["cline", "opencode"],
+    "additional_agents": ["qwen-code", "aider"]
+  },
   "server": {
     "binary": "llama-server",
     "host": "127.0.0.1",
@@ -31,27 +38,50 @@
     "server_repetitions": 2,
     "quality_repetitions": 1,
     "judge": {
-      "provider": "openai",
+      "provider": "manual",
       "base_url": "https://api.openai.com/v1",
-      "model": "gpt-5.5",
+      "model": null,
       "reasoning_effort": "low",
       "timeout_seconds": 120
     }
   },
   "use_cases": {
     "coder": {
-      "default_model": "coder-30b",
-      "candidate_models": ["coder-30b", "fast-9b"],
+      "default_model": "qwen3.6-35b-a3b",
+      "candidate_models": [
+        "qwen3.6-35b-a3b",
+        "devstral-small-2-24b",
+        "reason-27b"
+      ],
       "prompt_file": "benchmarks/prompts/coder.jsonl"
     },
     "reason": {
       "default_model": "reason-27b",
-      "candidate_models": ["reason-27b", "coder-30b"],
+      "candidate_models": [
+        "reason-27b",
+        "gpt-oss-20b",
+        "gpt-oss-120b",
+        "qwen3.5-122b-a10b"
+      ],
+      "prompt_file": "benchmarks/prompts/reason.jsonl"
+    },
+    "review": {
+      "default_model": "gpt-oss-120b",
+      "candidate_models": [
+        "gpt-oss-120b",
+        "qwen3.5-122b-a10b",
+        "reason-27b"
+      ],
       "prompt_file": "benchmarks/prompts/reason.jsonl"
     },
     "fast": {
       "default_model": "fast-9b",
-      "candidate_models": ["fast-9b"],
+      "candidate_models": ["fast-9b", "gpt-oss-20b"],
+      "prompt_file": "benchmarks/prompts/fast.jsonl"
+    },
+    "vision": {
+      "default_model": "gemma-4-12b",
+      "candidate_models": ["gemma-4-12b"],
       "prompt_file": "benchmarks/prompts/fast.jsonl"
     },
     "embedding": {
@@ -62,18 +92,57 @@
   },
   "models": {
     "coder-30b": {
-      "description": "Default agentic coding model: Qwen3-Coder 30B-A3B Instruct Q5_K_M.",
+      "description": "Retired historical agentic coding baseline: Qwen3-Coder 30B-A3B Instruct Q5_K_M.",
+      "official_model_id": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+      "release_date": "2025-07",
+      "architecture": "Qwen3 MoE",
+      "parameters_total_b": 30.5,
+      "parameters_active_b": 3.3,
+      "quantization": "Q5_K_M",
+      "license": "Apache-2.0",
+      "roles": ["coding", "agent", "historical"],
+      "status": "retired",
+      "expected_disk_gib": 20,
+      "context_tokens": 65536,
+      "source_url": "https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct",
+      "last_verified": "2026-07-24",
+      "retirement_note": "Superseded after Qwen3.6 35B-A3B and Devstral Small 2 passed the same runtime and agent tool-loop gates. Weights moved to Trash on 2026-07-24.",
+      "agent_compatibility": {
+        "cline": "pass",
+        "opencode": "pass",
+        "qwen-code": "partial",
+        "aider": "pending"
+      },
       "repo_id": "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
       "files": ["Qwen3-Coder-30B-A3B-Instruct-Q5_K_M.gguf"],
       "local_dir": "qwen3-coder-30b-a3b-instruct-q5_k_m",
       "preset": {
         "ctx-size": 65536,
-        "load-on-startup": true,
+        "load-on-startup": false,
         "stop-timeout": 10
       }
     },
     "reason-27b": {
-      "description": "On-demand reasoning and agent model: Qwen3.6 27B Q5_K_M.",
+      "description": "Balanced dense reasoning and coding model: Qwen3.6 27B Q5_K_M.",
+      "official_model_id": "Qwen/Qwen3.6-27B",
+      "release_date": "2026-04",
+      "architecture": "Qwen3.6 dense",
+      "parameters_total_b": 27,
+      "parameters_active_b": 27,
+      "quantization": "Q5_K_M",
+      "license": "Apache-2.0",
+      "roles": ["coding", "reasoning", "review"],
+      "status": "core",
+      "expected_disk_gib": 19.6,
+      "context_tokens": 32768,
+      "source_url": "https://huggingface.co/Qwen/Qwen3.6-27B",
+      "last_verified": "2026-07-24",
+      "agent_compatibility": {
+        "cline": "pass",
+        "opencode": "pass",
+        "qwen-code": "partial",
+        "aider": "pending"
+      },
       "repo_id": "bartowski/Qwen_Qwen3.6-27B-GGUF",
       "files": ["Qwen_Qwen3.6-27B-Q5_K_M.gguf"],
       "local_dir": "qwen3.6-27b-q5_k_m",
@@ -84,7 +153,26 @@
       }
     },
     "fast-9b": {
-      "description": "Fast general-purpose model: Qwen3.5 9B Q5_K_M.",
+      "description": "Low-latency utility baseline: Qwen3.5 9B Q5_K_M.",
+      "official_model_id": "Qwen/Qwen3.5-9B",
+      "release_date": "2026-02",
+      "architecture": "Qwen3.5 dense",
+      "parameters_total_b": 9,
+      "parameters_active_b": 9,
+      "quantization": "Q5_K_M",
+      "license": "Apache-2.0",
+      "roles": ["utility", "documentation", "exploration", "fast"],
+      "status": "core",
+      "expected_disk_gib": 6.5,
+      "context_tokens": 32768,
+      "source_url": "https://huggingface.co/Qwen/Qwen3.5-9B",
+      "last_verified": "2026-07-24",
+      "agent_compatibility": {
+        "cline": "pass",
+        "opencode": "pass",
+        "qwen-code": "partial",
+        "aider": "pending"
+      },
       "repo_id": "bartowski/Qwen_Qwen3.5-9B-GGUF",
       "files": ["Qwen_Qwen3.5-9B-Q5_K_M.gguf"],
       "local_dir": "qwen3.5-9b-q5_k_m",
@@ -94,8 +182,215 @@
         "stop-timeout": 10
       }
     },
+    "gpt-oss-20b": {
+      "description": "Small reasoning and tool-use baseline: gpt-oss-20b MXFP4.",
+      "official_model_id": "openai/gpt-oss-20b",
+      "release_date": "2025-08-05",
+      "architecture": "gpt-oss MoE",
+      "parameters_total_b": 21,
+      "parameters_active_b": 3.6,
+      "quantization": "MXFP4",
+      "license": "Apache-2.0",
+      "roles": ["reasoning", "tool-use", "comparison"],
+      "status": "candidate",
+      "expected_disk_gib": 11.5,
+      "context_tokens": 32768,
+      "source_url": "https://huggingface.co/openai/gpt-oss-20b",
+      "last_verified": "2026-07-24",
+      "admission_note": "Runtime and Cline/OpenCode tool loops pass, but the website issue #2 implementation failed the usability bar.",
+      "agent_compatibility": {
+        "cline": "pass",
+        "opencode": "pass",
+        "qwen-code": "pending",
+        "aider": "pending"
+      },
+      "repo_id": "ggml-org/gpt-oss-20b-GGUF",
+      "files": ["gpt-oss-20b-MXFP4.gguf"],
+      "local_dir": "gpt-oss-20b-mxfp4",
+      "preset": {
+        "ctx-size": 32768,
+        "load-on-startup": false,
+        "stop-timeout": 15
+      }
+    },
+    "qwen3.6-35b-a3b": {
+      "description": "Efficient sparse agent candidate: Qwen3.6 35B-A3B Q5_K_M.",
+      "official_model_id": "Qwen/Qwen3.6-35B-A3B",
+      "release_date": "2026-04",
+      "architecture": "Qwen3.6 MoE",
+      "parameters_total_b": 35,
+      "parameters_active_b": 3,
+      "quantization": "Q5_K_M",
+      "license": "Apache-2.0",
+      "roles": ["coding", "agent", "fast"],
+      "status": "core",
+      "expected_disk_gib": 24.2,
+      "context_tokens": 32768,
+      "source_url": "https://huggingface.co/Qwen/Qwen3.6-35B-A3B",
+      "last_verified": "2026-07-24",
+      "agent_compatibility": {
+        "cline": "pass",
+        "opencode": "pass",
+        "qwen-code": "pending",
+        "aider": "pending"
+      },
+      "repo_id": "bartowski/Qwen_Qwen3.6-35B-A3B-GGUF",
+      "files": ["Qwen_Qwen3.6-35B-A3B-Q5_K_M.gguf"],
+      "local_dir": "qwen3.6-35b-a3b-q5_k_m",
+      "preset": {
+        "ctx-size": 32768,
+        "load-on-startup": true,
+        "stop-timeout": 15
+      }
+    },
+    "devstral-small-2-24b": {
+      "description": "Balanced local coding-agent candidate: Devstral Small 2 24B Q5_K_M.",
+      "official_model_id": "mistralai/Devstral-Small-2-24B-Instruct-2512",
+      "release_date": "2025-12",
+      "architecture": "Mistral dense",
+      "parameters_total_b": 24,
+      "parameters_active_b": 24,
+      "quantization": "Q5_K_M",
+      "license": "Apache-2.0",
+      "roles": ["coding", "agent"],
+      "status": "core",
+      "expected_disk_gib": 15.7,
+      "context_tokens": 32768,
+      "source_url": "https://huggingface.co/mistralai/Devstral-Small-2-24B-Instruct-2512",
+      "last_verified": "2026-07-24",
+      "agent_compatibility": {
+        "cline": "pass",
+        "opencode": "pass",
+        "qwen-code": "pending",
+        "aider": "pending"
+      },
+      "repo_id": "bartowski/mistralai_Devstral-Small-2-24B-Instruct-2512-GGUF",
+      "files": ["mistralai_Devstral-Small-2-24B-Instruct-2512-Q5_K_M.gguf"],
+      "local_dir": "devstral-small-2-24b-q5_k_m",
+      "preset": {
+        "ctx-size": 32768,
+        "load-on-startup": false,
+        "stop-timeout": 15
+      }
+    },
+    "gpt-oss-120b": {
+      "description": "Flagship reasoning and review candidate: gpt-oss-120b MXFP4.",
+      "official_model_id": "openai/gpt-oss-120b",
+      "release_date": "2025-08-05",
+      "architecture": "gpt-oss MoE",
+      "parameters_total_b": 117,
+      "parameters_active_b": 5.1,
+      "quantization": "MXFP4",
+      "license": "Apache-2.0",
+      "roles": ["reasoning", "review", "coding", "tool-use"],
+      "status": "core",
+      "expected_disk_gib": 59.1,
+      "context_tokens": 32768,
+      "source_url": "https://huggingface.co/openai/gpt-oss-120b",
+      "last_verified": "2026-07-24",
+      "agent_compatibility": {
+        "cline": "pass",
+        "opencode": "pass",
+        "qwen-code": "pending",
+        "aider": "pending"
+      },
+      "local_dir": "gpt-oss-120b-mxfp4",
+      "files": [
+        "gpt-oss-120b-MXFP4-00001-of-00002.gguf",
+        "gpt-oss-120b-MXFP4-00002-of-00002.gguf"
+      ],
+      "model_file": "gpt-oss-120b-MXFP4-00001-of-00002.gguf",
+      "preset": {
+        "ctx-size": 32768,
+        "load-on-startup": false,
+        "stop-timeout": 30
+      }
+    },
+    "qwen3.5-122b-a10b": {
+      "description": "Flagship sparse reasoning and review candidate: Qwen3.5 122B-A10B Q4_K_M.",
+      "official_model_id": "Qwen/Qwen3.5-122B-A10B",
+      "release_date": "2026-02",
+      "architecture": "Qwen3.5 MoE",
+      "parameters_total_b": 122,
+      "parameters_active_b": 10,
+      "quantization": "Q4_K_M",
+      "license": "Apache-2.0",
+      "roles": ["reasoning", "review", "coding"],
+      "status": "core",
+      "expected_disk_gib": 72.3,
+      "context_tokens": 32768,
+      "source_url": "https://huggingface.co/Qwen/Qwen3.5-122B-A10B",
+      "last_verified": "2026-07-24",
+      "agent_compatibility": {
+        "cline": "pass",
+        "opencode": "pass",
+        "qwen-code": "pending",
+        "aider": "pending"
+      },
+      "repo_id": "bartowski/Qwen_Qwen3.5-122B-A10B-GGUF",
+      "files": [
+        "Qwen_Qwen3.5-122B-A10B-Q4_K_M/Qwen_Qwen3.5-122B-A10B-Q4_K_M-00001-of-00002.gguf",
+        "Qwen_Qwen3.5-122B-A10B-Q4_K_M/Qwen_Qwen3.5-122B-A10B-Q4_K_M-00002-of-00002.gguf"
+      ],
+      "model_file": "Qwen_Qwen3.5-122B-A10B-Q4_K_M/Qwen_Qwen3.5-122B-A10B-Q4_K_M-00001-of-00002.gguf",
+      "local_dir": "qwen3.5-122b-a10b-q4_k_m",
+      "preset": {
+        "ctx-size": 32768,
+        "load-on-startup": false,
+        "stop-timeout": 30
+      }
+    },
+    "gemma-4-12b": {
+      "description": "Multimodal general and UI-analysis candidate: Gemma 4 12B Q5_K_M.",
+      "official_model_id": "google/gemma-4-12b-it",
+      "release_date": "2026-06",
+      "architecture": "Gemma 4 dense multimodal",
+      "parameters_total_b": 12,
+      "parameters_active_b": 12,
+      "quantization": "Q5_K_M",
+      "license": "Apache-2.0",
+      "roles": ["vision", "ui-analysis", "general"],
+      "status": "core",
+      "expected_disk_gib": 8.3,
+      "context_tokens": 32768,
+      "source_url": "https://huggingface.co/google/gemma-4-12b-it",
+      "last_verified": "2026-07-24",
+      "agent_compatibility": {
+        "cline": "pass",
+        "opencode": "pass",
+        "qwen-code": "pending",
+        "aider": "pending"
+      },
+      "repo_id": "bartowski/gemma-4-12B-it-GGUF",
+      "files": [
+        "gemma-4-12B-it-Q5_K_M.gguf",
+        "mmproj-gemma-4-12B-it-f16.gguf"
+      ],
+      "model_file": "gemma-4-12B-it-Q5_K_M.gguf",
+      "local_dir": "gemma-4-12b-it-q5_k_m",
+      "preset": {
+        "ctx-size": 32768,
+        "mmproj": "${models_dir}/gemma-4-12b-it-q5_k_m/mmproj-gemma-4-12B-it-f16.gguf",
+        "load-on-startup": false,
+        "stop-timeout": 15
+      }
+    },
     "embed-4b": {
-      "description": "Embedding model: Qwen3 Embedding 4B Q5_K_M.",
+      "description": "Retrieval-quality embedding default: Qwen3 Embedding 4B Q5_K_M.",
+      "official_model_id": "Qwen/Qwen3-Embedding-4B",
+      "release_date": "2025-06",
+      "architecture": "Qwen3 embedding",
+      "parameters_total_b": 4,
+      "parameters_active_b": 4,
+      "quantization": "Q5_K_M",
+      "license": "Apache-2.0",
+      "roles": ["embedding", "retrieval"],
+      "status": "core",
+      "expected_disk_gib": 2.9,
+      "context_tokens": 8192,
+      "source_url": "https://huggingface.co/Qwen/Qwen3-Embedding-4B",
+      "last_verified": "2026-07-24",
+      "agent_compatibility": {},
       "repo_id": "Qwen/Qwen3-Embedding-4B-GGUF",
       "files": ["Qwen3-Embedding-4B-Q5_K_M.gguf"],
       "local_dir": "qwen3-embedding-4b-q5_k_m",
@@ -106,6 +401,127 @@
         "load-on-startup": false,
         "stop-timeout": 10
       }
+    }
+  },
+  "watchlist": {
+    "devstral-2-123b": {
+      "description": "Quality-first flagship coding experiment pending license, memory, load, and tool-call review.",
+      "official_model_id": "mistralai/Devstral-2-123B-Instruct-2512",
+      "release_date": "2025-12",
+      "architecture": "Mistral dense",
+      "parameters_total_b": 123,
+      "parameters_active_b": 123,
+      "quantization": "Q4_K_M",
+      "license": "Modified MIT",
+      "roles": ["coding", "agent", "flagship"],
+      "status": "watch",
+      "expected_disk_gib": 72,
+      "context_tokens": 32768,
+      "source_url": "https://huggingface.co/mistralai/Devstral-2-123B-Instruct-2512",
+      "last_verified": null,
+      "agent_compatibility": {}
+    },
+    "embedding-gemma-308m": {
+      "description": "Small embedding comparison for retrieval speed and deployment-size experiments.",
+      "official_model_id": "google/embeddinggemma-300m",
+      "release_date": "2025",
+      "architecture": "Gemma embedding",
+      "parameters_total_b": 0.308,
+      "parameters_active_b": 0.308,
+      "quantization": "Q5 class",
+      "license": "Gemma",
+      "roles": ["embedding", "retrieval", "small"],
+      "status": "watch",
+      "expected_disk_gib": 0.25,
+      "context_tokens": 2048,
+      "source_url": "https://huggingface.co/google/embeddinggemma-300m",
+      "last_verified": null,
+      "agent_compatibility": {}
+    },
+    "nemotron-3-nano": {
+      "description": "Nemotron 3 Nano duplicates the efficient 30B agent role under a custom model license.",
+      "official_model_id": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+      "release_date": "2025-12",
+      "architecture": "Nemotron hybrid MoE",
+      "parameters_total_b": 30,
+      "parameters_active_b": 3,
+      "quantization": null,
+      "license": "NVIDIA Open Model License",
+      "roles": ["reasoning", "agent"],
+      "status": "watch",
+      "expected_disk_gib": null,
+      "context_tokens": 128000,
+      "source_url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+      "last_verified": null,
+      "agent_compatibility": {}
+    },
+    "nemotron-3-super": {
+      "description": "Nemotron 3 Super duplicates the 120B flagship role under a custom model license.",
+      "official_model_id": "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
+      "release_date": "2026-03",
+      "architecture": "Nemotron MoE",
+      "parameters_total_b": 120,
+      "parameters_active_b": 12,
+      "quantization": null,
+      "license": "NVIDIA Open Model License",
+      "roles": ["reasoning", "agent", "flagship"],
+      "status": "watch",
+      "expected_disk_gib": null,
+      "context_tokens": 128000,
+      "source_url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
+      "last_verified": null,
+      "agent_compatibility": {}
+    },
+    "trinity-mini": {
+      "description": "Efficient 26B-A3B reasoning alternative deferred because it duplicates current roles and uses OpenMDW-1.1.",
+      "official_model_id": "arcee-ai/Trinity-Mini",
+      "release_date": "2025-12",
+      "architecture": "Arcee AFMoE",
+      "parameters_total_b": 26,
+      "parameters_active_b": 3,
+      "quantization": null,
+      "license": "OpenMDW-1.1",
+      "roles": ["reasoning", "agent"],
+      "status": "watch",
+      "expected_disk_gib": null,
+      "context_tokens": 128000,
+      "source_url": "https://huggingface.co/arcee-ai/Trinity-Mini",
+      "last_verified": null,
+      "agent_compatibility": {}
+    },
+    "frontier-oversized": {
+      "description": "GLM-5.2, Nemotron 3 Ultra, Trinity Large, DeepSeek V3.2, and Kimi-class models exceed the reliable 128 GB Mac workflow.",
+      "official_model_id": "multiple",
+      "release_date": "2026",
+      "architecture": "large sparse and dense frontier models",
+      "parameters_total_b": null,
+      "parameters_active_b": null,
+      "quantization": null,
+      "license": "various",
+      "roles": ["frontier"],
+      "status": "watch",
+      "expected_disk_gib": 128,
+      "context_tokens": null,
+      "source_url": null,
+      "last_verified": null,
+      "agent_compatibility": {}
+    },
+    "gemma-4-mtp": {
+      "description": "MTP assistants remain deferred until mainline llama.cpp support is complete.",
+      "official_model_id": "google/gemma-4",
+      "release_date": "2026",
+      "architecture": "Gemma 4 MTP",
+      "parameters_total_b": null,
+      "parameters_active_b": null,
+      "quantization": null,
+      "license": "Apache-2.0",
+      "roles": ["mtp", "speculative-decoding"],
+      "status": "watch",
+      "expected_disk_gib": null,
+      "context_tokens": null,
+      "source_url": "https://ai.google.dev/gemma/docs/core/model_card_4",
+      "last_verified": null,
+      "agent_compatibility": {}
     }
   }
 }

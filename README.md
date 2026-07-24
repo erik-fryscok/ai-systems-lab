@@ -8,9 +8,11 @@ The default setup is:
 
 | Use case | Default alias | Purpose |
 | --- | --- | --- |
-| `coder` | `coder-30b` | Qwen3-Coder 30B-A3B Q5_K_M, loaded at startup |
+| `coder` | `qwen3.6-35b-a3b` | Qwen3.6 35B-A3B Q5_K_M, loaded at startup |
 | `reason` | `reason-27b` | Qwen3.6 27B Q5_K_M, loaded on demand |
+| `review` | `gpt-oss-120b` | Flagship reasoning and skeptical review |
 | `fast` | `fast-9b` | Qwen3.5 9B Q5_K_M, loaded on demand |
+| `vision` | `gemma-4-12b` | Multimodal UI and screenshot analysis candidate |
 | `embedding` | `embed-4b` | Qwen3 Embedding 4B Q5_K_M |
 
 ## Requirements
@@ -130,6 +132,28 @@ Important sections:
 - `preset_defaults`: llama.cpp args applied to every model preset.
 - `use_cases`: workload names, defaults, candidate models, and prompt files.
 - `models`: stable aliases, Hugging Face source files, local dirs, and per-model preset args.
+- `watchlist`: models that are intentionally not pullable until admitted to the
+  runnable fleet.
+
+Machine-specific model paths belong in the ignored `config/lab.local.json`
+overlay. Copy [config/lab.local.example.json](config/lab.local.example.json)
+and override only the fields that differ locally. The committed catalog never
+contains a user-specific absolute path. The current machine uses this mechanism
+to point `gpt-oss-120b` at existing LM Studio shards instead of duplicating
+roughly 63 GB of weights.
+
+Inspect the curated fleet without exposing local paths:
+
+```sh
+./scripts/lab catalog
+./scripts/lab catalog --role coding
+./scripts/lab catalog --status candidate --format json
+```
+
+Each catalog entry records release identity, architecture, total and active
+parameters, quantization, license, roles, lifecycle, disk expectation, context,
+source, last verification, and agent compatibility. See
+[docs/model-fleet.md](docs/model-fleet.md) for lifecycle and admission rules.
 
 By default, `server.models_autoload` is `false` and `server.models_max` is
 `null`. The wrapper then starts llama.cpp with enough capacity for one
@@ -187,20 +211,10 @@ Dry run a large download:
 ./scripts/lab pull reason --dry-run
 ```
 
-Pull every configured model:
-
-```sh
-make pull-all
-```
-
-The configured defaults currently resolve to these approximate download sizes:
-
-| Alias | File | Size |
-| --- | --- | --- |
-| `coder-30b` | `Qwen3-Coder-30B-A3B-Instruct-Q5_K_M.gguf` | 21.7 GB |
-| `reason-27b` | `Qwen_Qwen3.6-27B-Q5_K_M.gguf` | 21.0 GB |
-| `fast-9b` | `Qwen_Qwen3.5-9B-Q5_K_M.gguf` | 7.1 GB |
-| `embed-4b` | `Qwen3-Embedding-4B-Q5_K_M.gguf` | 2.9 GB |
+Do not use `pull all` for fleet expansion. Download in small, medium, and
+flagship waves so disk usage, license review, and runtime compatibility are
+checked before the next wave. The installed core plus active-candidate weight
+budget is 400 GiB.
 
 ## Router Commands
 
@@ -229,6 +243,18 @@ Quick smoke chat:
 ```sh
 ./scripts/lab chat coder "Write a small TypeScript debounce function."
 ```
+
+Run the compatibility gate for a candidate:
+
+```sh
+./scripts/lab verify fast-9b
+```
+
+`verify` checks every configured GGUF file, load, visible completion,
+non-streaming structured tool calls, streaming `delta.tool_calls`, one-model
+residency, and clean unload or restoration of the previous state. A model is
+not promoted to `core` until it also completes real tool loops in Cline and
+OpenCode. Qwen Code and Aider are recorded as additional scaffold evidence.
 
 ## Always-on macOS Service
 
@@ -330,32 +356,44 @@ Use both benchmark modes:
 - `bench-llama` isolates model/runtime throughput for prompt and generation token rates.
 - `bench-server` measures the workload path your apps use, including router load behavior and request latency.
 
-Quality and correctness benchmark with an OpenAI judge:
+Quality and correctness benchmark with manual review by default:
 
 ```sh
-export OPENAI_API_KEY=...
 ./scripts/lab bench-quality coder --all-candidates
 ./scripts/lab bench-quality reason --all-candidates
 ./scripts/lab bench-quality fast --all-candidates
 ```
 
 `bench-quality` runs the same local router path, saves each model answer, and
-scores it with OpenAI's Responses API using structured JSON output. The default
-judge is configured in [config/lab.json](config/lab.json):
+creates `manual-review.json`. This keeps paid inference out of the baseline and
+keeps automated acceptance criteria plus blind human review above model judging.
+The default 4096-token output budget leaves room for reasoning-capable models
+to produce a visible answer; an empty visible completion is recorded as a
+failed result rather than sent for review.
+The default is configured in [config/lab.json](config/lab.json):
 
 ```json
 "judge": {
-  "provider": "openai",
-  "base_url": "https://api.openai.com/v1",
-  "model": "gpt-5.5",
-  "reasoning_effort": "low"
+  "provider": "manual"
 }
 ```
 
-Override judge settings per run:
+Use another local fleet model as secondary evidence:
 
 ```sh
-./scripts/lab bench-quality coder --all-candidates --judge-model gpt-5.5 --limit-prompts 1
+./scripts/lab bench-quality coder \
+  --all-candidates \
+  --judge-provider local \
+  --judge-model gpt-oss-120b
+```
+
+Paid OpenAI judging remains an explicit opt-in:
+
+```sh
+export OPENAI_API_KEY=...
+./scripts/lab bench-quality coder \
+  --judge-provider openai \
+  --judge-model gpt-5.5
 ```
 
 Quality results are written under:
@@ -364,10 +402,30 @@ Quality results are written under:
 benchmarks/results/<timestamp>-quality-<selector>/
 ```
 
-Each row includes the local model answer, judge scores for correctness,
-completeness, instruction following, clarity, an overall 1-5 score, pass/fail,
-and the judge rationale. Prompt-specific rubrics live alongside the prompt rows
-in [benchmarks/prompts](benchmarks/prompts).
+Each raw result row includes the local model answer and performance data.
+Manual runs create a review template for correctness, completeness, instruction
+following, clarity, an overall 1-5 score, pass/fail, and rationale. Local or
+OpenAI judge runs populate those fields automatically as secondary evidence.
+Server and quality runs sample the selected llama.cpp model worker's resident
+set size and report its observed peak in GiB; this is a comparable process-level
+measurement, not total system or GPU energy telemetry.
+Prompt-specific rubrics live alongside the prompt rows in
+[benchmarks/prompts](benchmarks/prompts).
+
+Before publishing any result, create a sanitized artifact:
+
+```sh
+./scripts/lab export-public benchmarks/results/<result-dir> \
+  --output /tmp/public-result.json
+```
+
+The export omits raw answers, evaluation payloads, commands, private repository
+metadata, local paths, host details, response identifiers, and credentials. Raw
+benchmark state remains private.
+
+The comparison contract, result hierarchy, publication fields, and scenario
+matrix are documented in
+[docs/benchmark-methodology.md](docs/benchmark-methodology.md).
 
 ## Upstream Notes
 
@@ -381,7 +439,7 @@ Hugging Face documents the current CLI as
 uses `hf download` with `--local-dir` and falls back to `huggingface-cli` if
 needed.
 
-The quality benchmark uses OpenAI's
+The optional paid quality judge uses OpenAI's
 [Responses API](https://developers.openai.com/api/docs/guides/migrate-to-responses)
 and [Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs)
 for schema-constrained judge responses.
