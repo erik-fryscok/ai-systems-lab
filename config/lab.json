@@ -1,0 +1,111 @@
+{
+  "paths": {
+    "models_dir": "~/Models/local-ai-lab",
+    "state_dir": ".local-ai-lab",
+    "generated_dir": "config/generated",
+    "results_dir": "benchmarks/results"
+  },
+  "server": {
+    "binary": "llama-server",
+    "host": "127.0.0.1",
+    "port": 8080,
+    "models_max": null,
+    "models_autoload": false,
+    "metrics": true,
+    "sleep_idle_seconds": null,
+    "extra_args": ["--jinja"]
+  },
+  "preset_defaults": {
+    "ctx-size": 8192,
+    "n-gpu-layers": 999,
+    "flash-attn": "auto",
+    "batch-size": 2048,
+    "ubatch-size": 512,
+    "mmap": true
+  },
+  "benchmarks": {
+    "llama_bench_binary": "llama-bench",
+    "repetitions": 3,
+    "n_prompt": [512, 2048],
+    "n_gen": [128, 512],
+    "server_repetitions": 2,
+    "quality_repetitions": 1,
+    "judge": {
+      "provider": "openai",
+      "base_url": "https://api.openai.com/v1",
+      "model": "gpt-5.5",
+      "reasoning_effort": "low",
+      "timeout_seconds": 120
+    }
+  },
+  "use_cases": {
+    "coder": {
+      "default_model": "coder-30b",
+      "candidate_models": ["coder-30b", "fast-9b"],
+      "prompt_file": "benchmarks/prompts/coder.jsonl"
+    },
+    "reason": {
+      "default_model": "reason-27b",
+      "candidate_models": ["reason-27b", "coder-30b"],
+      "prompt_file": "benchmarks/prompts/reason.jsonl"
+    },
+    "fast": {
+      "default_model": "fast-9b",
+      "candidate_models": ["fast-9b"],
+      "prompt_file": "benchmarks/prompts/fast.jsonl"
+    },
+    "embedding": {
+      "default_model": "embed-4b",
+      "candidate_models": ["embed-4b"],
+      "prompt_file": "benchmarks/prompts/embedding.jsonl"
+    }
+  },
+  "models": {
+    "coder-30b": {
+      "description": "Default agentic coding model: Qwen3-Coder 30B-A3B Instruct Q5_K_M.",
+      "repo_id": "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
+      "files": ["Qwen3-Coder-30B-A3B-Instruct-Q5_K_M.gguf"],
+      "local_dir": "qwen3-coder-30b-a3b-instruct-q5_k_m",
+      "preset": {
+        "ctx-size": 65536,
+        "load-on-startup": true,
+        "stop-timeout": 10
+      }
+    },
+    "reason-27b": {
+      "description": "On-demand reasoning and agent model: Qwen3.6 27B Q5_K_M.",
+      "repo_id": "bartowski/Qwen_Qwen3.6-27B-GGUF",
+      "files": ["Qwen_Qwen3.6-27B-Q5_K_M.gguf"],
+      "local_dir": "qwen3.6-27b-q5_k_m",
+      "preset": {
+        "ctx-size": 32768,
+        "load-on-startup": false,
+        "stop-timeout": 15
+      }
+    },
+    "fast-9b": {
+      "description": "Fast general-purpose model: Qwen3.5 9B Q5_K_M.",
+      "repo_id": "bartowski/Qwen_Qwen3.5-9B-GGUF",
+      "files": ["Qwen_Qwen3.5-9B-Q5_K_M.gguf"],
+      "local_dir": "qwen3.5-9b-q5_k_m",
+      "preset": {
+        "ctx-size": 32768,
+        "load-on-startup": false,
+        "stop-timeout": 10
+      }
+    },
+    "embed-4b": {
+      "description": "Embedding model: Qwen3 Embedding 4B Q5_K_M.",
+      "repo_id": "Qwen/Qwen3-Embedding-4B-GGUF",
+      "files": ["Qwen3-Embedding-4B-Q5_K_M.gguf"],
+      "local_dir": "qwen3-embedding-4b-q5_k_m",
+      "preset": {
+        "ctx-size": 8192,
+        "embeddings": true,
+        "pooling": "last",
+        "load-on-startup": false,
+        "stop-timeout": 10
+      }
+    }
+  }
+}
