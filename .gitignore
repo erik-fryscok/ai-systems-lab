@@ -1,0 +1,11 @@
+.DS_Store
+.idea/
+.local-ai-lab/
+.venv/
+__pycache__/
+*.py[cod]
+config/generated/
+config/lab.local.json
+benchmarks/results/
+*.log
+*.pid
