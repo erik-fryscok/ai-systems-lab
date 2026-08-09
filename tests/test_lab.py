@@ -242,6 +242,39 @@ class VerificationTests(unittest.TestCase):
         update_state.assert_not_called()
 
 
+class GatewayTests(unittest.TestCase):
+    def test_backend_uses_private_port_while_gateway_keeps_client_port(self):
+        config = {"server": {"host": "127.0.0.1", "port": 8080, "backend_port": 8081}}
+
+        self.assertEqual(lab.api_base(config), "http://127.0.0.1:8080")
+        self.assertEqual(lab.backend_api_base(config), "http://127.0.0.1:8081")
+
+    def test_gateway_rejects_automatic_switch_while_benchmark_is_pinned(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"LOCAL_AI_LAB_STATE_PATH": str(Path(directory) / "state.json")}, clear=False
+        ):
+            model_dir = Path(directory) / "fast"
+            model_dir.mkdir()
+            (model_dir / "fast.gguf").touch()
+            config = {
+                "paths": {"state_dir": ".local-ai-lab", "models_dir": directory},
+                "models": {"fast": {"status": "core", "files": ["fast.gguf"], "local_dir": "fast"}},
+            }
+            lab.save_service_state({
+                "auto_idle_enabled": True,
+                "auto_idle_seconds": 900,
+                "manual_unloaded": False,
+                "mode": "benchmark",
+                "pinned_model": "other",
+            })
+            gateway = lab.Gateway(config)
+            try:
+                with self.assertRaisesRegex(lab.LabError, "automatic switching is disabled"):
+                    gateway.ensure_model("fast")
+            finally:
+                gateway.close()
+
+
 class PublicExportTests(unittest.TestCase):
     def test_sanitize_public_value_drops_answers_and_local_metadata(self):
         source = {

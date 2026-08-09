@@ -16,10 +16,13 @@
     "binary": "llama-server",
     "host": "127.0.0.1",
     "port": 8080,
+    "backend_port": 8081,
     "models_max": null,
     "models_autoload": false,
     "metrics": true,
     "sleep_idle_seconds": null,
+    "load_timeout_seconds": 900,
+    "request_timeout_seconds": 1800,
     "extra_args": ["--jinja"]
   },
   "preset_defaults": {

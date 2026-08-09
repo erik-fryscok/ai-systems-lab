@@ -5,6 +5,7 @@ import copy
 import csv
 import datetime as dt
 import hashlib
+import http.server
 import json
 import os
 import platform
@@ -31,9 +32,11 @@ SERVICE_STATE_DIR = Path.home() / "Library" / "Application Support" / SERVICE_LA
 SERVICE_STATE_PATH = SERVICE_STATE_DIR / "state.json"
 LAUNCH_AGENT_PATH = Path.home() / "Library" / "LaunchAgents" / f"{SERVICE_LABEL}.plist"
 DEFAULT_SERVICE_STATE = {
-    "auto_idle_enabled": False,
+    "auto_idle_enabled": True,
     "auto_idle_seconds": 900,
     "manual_unloaded": False,
+    "mode": "cline",
+    "pinned_model": None,
 }
 
 
@@ -121,6 +124,8 @@ def load_service_state():
         state.update({key: stored[key] for key in DEFAULT_SERVICE_STATE if key in stored})
     state["auto_idle_enabled"] = bool(state["auto_idle_enabled"])
     state["manual_unloaded"] = bool(state["manual_unloaded"])
+    if state["mode"] not in {"cline", "benchmark"}:
+        raise LabError("service mode must be 'cline' or 'benchmark'")
     try:
         state["auto_idle_seconds"] = int(state["auto_idle_seconds"])
     except (TypeError, ValueError) as exc:
@@ -159,15 +164,12 @@ def runtime_config(cfg, state=None):
             raise LabError("LOCAL_AI_LAB_IDLE_SECONDS_OVERRIDE must be an integer") from exc
         if idle_seconds <= 0:
             raise LabError("LOCAL_AI_LAB_IDLE_SECONDS_OVERRIDE must be greater than zero")
-    effective["server"]["sleep_idle_seconds"] = (
-        idle_seconds if state["auto_idle_enabled"] else None
-    )
+    # The gateway, not llama.cpp, performs unload-on-idle. llama.cpp sleep
+    # leaves weights resident, which is not the intended Cline behavior.
+    effective["server"]["sleep_idle_seconds"] = None
     preset_defaults = effective.setdefault("preset_defaults", {})
-    if state["auto_idle_enabled"]:
-        preset_defaults["sleep-idle-seconds"] = idle_seconds
-    else:
-        preset_defaults.pop("sleep-idle-seconds", None)
-    if state["manual_unloaded"]:
+    preset_defaults.pop("sleep-idle-seconds", None)
+    if state["manual_unloaded"] or state["mode"] == "cline":
         for entry in effective.get("models", {}).values():
             entry.setdefault("preset", {})["load-on-startup"] = False
     return effective
@@ -789,7 +791,9 @@ def process_command(pid):
 def is_lab_server_process(pid, cfg):
     command = process_command(pid)
     preset = str(generated_preset_path(cfg))
-    return "llama-server" in command and (preset in command or str(REPO_ROOT) in command)
+    return ("llama-server" in command and (preset in command or str(REPO_ROOT) in command)) or (
+        str(Path(__file__).resolve()) in command and "serve" in command
+    )
 
 
 def stop_pid(pid, wait=15, force=False):
@@ -826,6 +830,241 @@ def stop_ad_hoc_server(cfg, wait=15, force=False):
     return candidates
 
 
+def backend_api_base(cfg):
+    server = cfg.get("server", {})
+    return f"http://{server.get('host', '127.0.0.1')}:{server.get('backend_port', 8081)}"
+
+
+class Gateway:
+    """Serializes llama.cpp model transitions before proxying OpenAI requests."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.lock = threading.Lock()
+        self.last_generation_request = time.monotonic()
+        self.last_transition = None
+        self.stop_idle = threading.Event()
+        self.idle_thread = threading.Thread(target=self._idle_loop, daemon=True)
+        self.idle_thread.start()
+
+    def close(self):
+        self.stop_idle.set()
+        self.idle_thread.join(timeout=2)
+
+    def _record(self, event, **details):
+        row = {"at": dt.datetime.now(dt.timezone.utc).isoformat(), "event": event, **details}
+        path = state_file(self.cfg, "gateway-events.jsonl")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, sort_keys=True) + "\n")
+
+    def _backend_models(self):
+        return json_request("GET", f"{backend_api_base(self.cfg)}/models", timeout=10).get("data", [])
+
+    def _status(self, model_id):
+        for item in self._backend_models():
+            if item.get("id") == model_id:
+                return (item.get("status") or {}).get("value"), item
+        return None, None
+
+    def _wait_loaded(self, model_id, timeout):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            status, item = self._status(model_id)
+            if status == "loaded":
+                return item
+            if item and (item.get("status") or {}).get("failed"):
+                raise LabError(f"model {model_id} failed to load; inspect scripts/lab logs")
+            time.sleep(1)
+        raise LabError(f"model {model_id} did not finish loading within {timeout}s")
+
+    def _unload(self, model_id):
+        json_request("POST", f"{backend_api_base(self.cfg)}/models/unload", {"model": model_id}, timeout=300)
+        deadline = time.monotonic() + 300
+        while time.monotonic() < deadline:
+            status, _ = self._status(model_id)
+            if status not in ACTIVE_MODEL_STATES:
+                return
+            time.sleep(0.5)
+        raise LabError(f"model {model_id} did not unload within 300s")
+
+    def ensure_model(self, model_id):
+        entry = model_entry(self.cfg, model_id)
+        if entry.get("status") == "retired":
+            raise LabError(f"{model_id} is retired and cannot be loaded")
+        missing = [path for path in model_weight_paths(self.cfg, model_id) if not path.exists()]
+        if missing:
+            raise LabError("model files are missing for " + model_id + ": " + ", ".join(str(path) for path in missing))
+        state = load_service_state()
+        if state["mode"] == "benchmark" and state.get("pinned_model") != model_id:
+            raise LabError(f"benchmark mode is pinned to {state.get('pinned_model') or 'no model'}; automatic switching is disabled")
+        if not is_embedding_model(self.cfg, model_id) and state["manual_unloaded"]:
+            update_service_state(manual_unloaded=False)
+        with self.lock:
+            started = time.monotonic()
+            status, _ = self._status(model_id)
+            if status == "loaded":
+                self.last_generation_request = time.monotonic()
+                return {"model": model_id, "status": "already_loaded", "load_seconds": 0}
+            unloaded = []
+            if not is_embedding_model(self.cfg, model_id):
+                for item in self._backend_models():
+                    other = item.get("id")
+                    other_status = (item.get("status") or {}).get("value")
+                    if other != model_id and not is_embedding_model(self.cfg, other) and other_status in ACTIVE_MODEL_STATES:
+                        self._unload(other)
+                        unloaded.append(other)
+            timeout = int(self.cfg.get("server", {}).get("load_timeout_seconds", 900))
+            json_request("POST", f"{backend_api_base(self.cfg)}/models/load", {"model": model_id}, timeout=timeout)
+            self._wait_loaded(model_id, timeout)
+            elapsed = round(time.monotonic() - started, 3)
+            self.last_transition = {"model": model_id, "unloaded": unloaded, "load_seconds": elapsed}
+            self.last_generation_request = time.monotonic()
+            self._record("model_loaded", **self.last_transition)
+            return {"model": model_id, "status": "loaded", **self.last_transition}
+
+    def _idle_loop(self):
+        while not self.stop_idle.wait(5):
+            try:
+                state = load_service_state()
+                if state["mode"] != "cline" or not state["auto_idle_enabled"]:
+                    continue
+                if time.monotonic() - self.last_generation_request < state["auto_idle_seconds"]:
+                    continue
+                with self.lock:
+                    for item in self._backend_models():
+                        model_id = item.get("id")
+                        status = (item.get("status") or {}).get("value")
+                        if not is_embedding_model(self.cfg, model_id) and status in ACTIVE_MODEL_STATES:
+                            self._unload(model_id)
+                            self._record("model_unloaded_idle", model=model_id)
+            except Exception as exc:
+                self._record("idle_unload_failed", error=str(exc))
+
+
+class GatewayHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, format, *args):
+        return
+
+    def _json_error(self, status, message):
+        body = json.dumps({"error": {"message": message, "type": "invalid_request_error"}}).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_body(self):
+        return self.rfile.read(int(self.headers.get("Content-Length", "0")))
+
+    def _proxy(self, body=None):
+        gateway = self.server.gateway
+        url = f"{backend_api_base(gateway.cfg)}{self.path}"
+        headers = {key: value for key, value in self.headers.items() if key.lower() not in {"host", "content-length", "connection"}}
+        request = urllib.request.Request(url, data=body, headers=headers, method=self.command)
+        try:
+            with urllib.request.urlopen(request, timeout=int(gateway.cfg["server"].get("request_timeout_seconds", 1800))) as response:
+                streaming = response.headers.get_content_type() == "text/event-stream"
+                self.send_response(response.status)
+                for key, value in response.headers.items():
+                    if key.lower() not in {"transfer-encoding", "connection", "content-length"}:
+                        self.send_header(key, value)
+                if streaming:
+                    self.end_headers()
+                    # Preserve token delivery for Cline instead of buffering a
+                    # potentially long stream behind the gateway.
+                    while chunk := response.read(8192):
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                    self.close_connection = True
+                else:
+                    data = response.read()
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+        except urllib.error.HTTPError as exc:
+            self.send_response(exc.code)
+            data = exc.read()
+            self.send_header("Content-Type", exc.headers.get("Content-Type", "application/json"))
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    def _stable_models(self):
+        data = [{"id": model_id, "object": "model", "owned_by": "local-ai-lab"}
+                for model_id, entry in sorted(self.server.gateway.cfg.get("models", {}).items())
+                if entry.get("status") != "retired"]
+        body = json.dumps({"object": "list", "data": data}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/v1/models":
+            return self._stable_models()
+        return self._proxy()
+
+    def do_POST(self):
+        body = self._read_body()
+        if self.path == "/models/load":
+            try:
+                model_id = json.loads(body).get("model")
+                result = self.server.gateway.ensure_model(model_id)
+            except (json.JSONDecodeError, AttributeError, LabError) as exc:
+                return self._json_error(400, str(exc))
+            data = json.dumps(result).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        if self.path == "/models/unload":
+            try:
+                model_id = json.loads(body).get("model")
+                if not isinstance(model_id, str):
+                    raise LabError("unload requires a model alias")
+                with self.server.gateway.lock:
+                    self.server.gateway._unload(model_id)
+                result = {"model": model_id, "status": "unloaded"}
+            except (json.JSONDecodeError, AttributeError, LabError) as exc:
+                return self._json_error(400, str(exc))
+            data = json.dumps(result).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        if self.path in {"/v1/chat/completions", "/v1/completions", "/v1/embeddings"}:
+            try:
+                payload = json.loads(body)
+                model_id = payload.get("model")
+                if not isinstance(model_id, str):
+                    raise LabError("request must include a catalog model alias")
+                self.server.gateway.ensure_model(model_id)
+            except (json.JSONDecodeError, LabError) as exc:
+                return self._json_error(400 if "Unknown model" in str(exc) or "must include" in str(exc) else 409, str(exc))
+        return self._proxy(body)
+
+
+class GatewayServer(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, address, cfg):
+        self.gateway = Gateway(cfg)
+        super().__init__(address, GatewayHandler)
+
+    def server_close(self):
+        self.gateway.close()
+        super().server_close()
+
+
 def server_command(cfg):
     server = cfg.get("server", {})
     binary = server.get("binary", "llama-server")
@@ -834,7 +1073,7 @@ def server_command(cfg):
     command = [
         binary_path,
         "--host", str(server.get("host", "127.0.0.1")),
-        "--port", str(server.get("port", 8080)),
+        "--port", str(server.get("backend_port", 8081)),
         "--models-preset", str(preset),
         "--models-max", str(router_models_max(cfg)),
     ]
@@ -994,9 +1233,40 @@ def cmd_serve(args, cfg):
     effective = runtime_config(cfg)
     validate_startup_models(effective)
     command = server_command(effective)
-    record_server_command(cfg, command, os.getpid(), "launchd")
-    os.chdir(REPO_ROOT)
-    os.execv(command[0], command)
+    p = paths(cfg)
+    p["state_dir"].mkdir(parents=True, exist_ok=True)
+    log_path = state_file(cfg, "server.log")
+    with open(log_path, "ab") as log:
+        log.write(f"\n--- {dt.datetime.now().isoformat()} gateway starting ---\n".encode("utf-8"))
+        log.write((command_to_string(command) + "\n").encode("utf-8"))
+        backend = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, cwd=str(REPO_ROOT))
+    try:
+        wait_for_models_endpoint_backend(cfg, 120)
+        record_server_command(cfg, command, os.getpid(), "gateway")
+        server = GatewayServer((effective["server"].get("host", "127.0.0.1"), effective["server"].get("port", 8080)), effective)
+        try:
+            server.serve_forever(poll_interval=0.5)
+        finally:
+            server.server_close()
+    finally:
+        if backend.poll() is None:
+            backend.terminate()
+            try:
+                backend.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                backend.kill()
+
+
+def wait_for_models_endpoint_backend(cfg, deadline_seconds):
+    deadline = time.time() + deadline_seconds
+    last_error = None
+    while time.time() < deadline:
+        try:
+            return json_request("GET", f"{backend_api_base(cfg)}/models", timeout=3)
+        except Exception as exc:
+            last_error = exc
+            time.sleep(0.5)
+    raise LabError(f"Backend did not respond at {backend_api_base(cfg)}/models within {deadline_seconds}s: {last_error}")
 
 
 def start_ad_hoc_server(args, cfg):
@@ -1458,15 +1728,27 @@ def cmd_auto_idle(args, cfg):
     state["auto_idle_enabled"] = enabled
     save_service_state(state)
 
-    if changed and service_is_loaded():
-        restart_service(cfg, wait=args.wait)
-    elif changed and api_is_ready(cfg):
-        stop_ad_hoc_server(cfg, wait=15)
-        start_ad_hoc_server(argparse.Namespace(wait=args.wait, skip_model_check=False), cfg)
-
     label = "enabled" if enabled else "disabled"
     suffix = f" after {state['auto_idle_seconds'] // 60} minutes" if enabled else ""
     print(f"auto-idle {label}{suffix}")
+
+
+def cmd_mode(args, cfg):
+    state = load_service_state()
+    if args.mode == "cline":
+        state.update({"mode": "cline", "pinned_model": None, "manual_unloaded": False})
+        save_service_state(state)
+        print("mode: cline (JIT loading and idle unload enabled)")
+        return
+    if not args.model:
+        raise LabError("benchmark mode requires a model alias to pin")
+    model_id = resolve_selector(cfg, args.model)
+    if not api_is_ready(cfg):
+        raise LabError("Local AI server is offline. Run 'make start' first.")
+    switch_to_model(cfg, model_id, timeout=args.timeout)
+    state.update({"mode": "benchmark", "pinned_model": model_id, "manual_unloaded": False})
+    save_service_state(state)
+    print(f"mode: benchmark (pinned to {model_id}; automatic switching disabled)")
 
 
 def cmd_chat(args, cfg):
@@ -2768,6 +3050,11 @@ def build_parser():
     auto_idle.add_argument("action", choices=["on", "off", "toggle", "status"])
     auto_idle.add_argument("--wait", type=int, default=180)
 
+    mode = sub.add_parser("mode", help="select Cline JIT or reproducible benchmark residency")
+    mode.add_argument("mode", choices=["cline", "benchmark"])
+    mode.add_argument("model", nargs="?")
+    mode.add_argument("--timeout", type=int, default=900)
+
     logs = sub.add_parser("logs")
     logs.add_argument("--lines", type=int, default=120)
 
@@ -2863,6 +3150,7 @@ COMMANDS = {
     "service-status": cmd_status,
     "service-uninstall": cmd_service_uninstall,
     "auto-idle": cmd_auto_idle,
+    "mode": cmd_mode,
     "logs": cmd_logs,
     "list": cmd_list,
     "load": cmd_load,
