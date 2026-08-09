@@ -9,11 +9,12 @@ http://127.0.0.1:8080/v1
 Compatibility evidence recorded on 2026-07-24 used llama.cpp build `b10090`,
 Cline CLI `3.0.46`, OpenCode `1.18.4`, and Qwen Code `0.19.6`.
 
-Switch the resident alias through `scripts/lab` before starting an agent:
-
-```sh
-./scripts/lab switch fast-9b
-```
+`local-ai-lab` is a persistent JIT gateway. Select the catalog alias in the
+agent configuration; the gateway validates files, serializes any necessary
+unload/load transition, waits for readiness, and forwards the original request.
+It keeps one generation model resident for later requests and unloads it after
+roughly 15 minutes of idle time. `/v1/models` exposes catalog aliases rather
+than GGUF filenames.
 
 ## Cline
 
@@ -27,7 +28,26 @@ cline auth openai-compatible \
 ```
 
 Use `openai-compatible` and the selected catalog alias. The API key is a
-non-secret placeholder required by the client.
+non-secret placeholder required by the client. Configure Cline's context limit
+to the alias's `context_tokens` value in `config/lab.json` (currently 32,768 for
+the active Cline aliases); the gateway renders the same value into llama.cpp.
+
+Large aliases such as `gpt-oss-120b` may take tens of seconds for their first
+request. Keep the client request timeout generous; the gateway uses a 15-minute
+load timeout and a 30-minute forwarded-request timeout by default.
+
+## Benchmark Mode
+
+For reproducible measurements, pin a model before invoking benchmark commands:
+
+```sh
+./scripts/lab mode benchmark qwen3.6-35b-a3b
+./scripts/lab bench-server coder
+./scripts/lab mode cline
+```
+
+Benchmark mode disables automatic alias changes: requests for a different model
+return a conflict instead of altering clean residency.
 
 ## OpenCode
 

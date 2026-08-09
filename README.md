@@ -1,8 +1,10 @@
 # local-ai-lab
 
-Local llama.cpp lab for running one router endpoint with workload-specific model
-aliases, repeatable Hugging Face pulls, and benchmark output you can compare over
-time.
+Local llama.cpp lab for running one persistent gateway endpoint with
+workload-specific model aliases, repeatable Hugging Face pulls, and benchmark
+output you can compare over time. Cline sends an alias in each request; the
+gateway JIT-loads it, evicts the previous generation model, then forwards the
+original request.
 
 The default setup is:
 
@@ -84,12 +86,8 @@ make stop
 
 ## Client Usage
 
-Use one endpoint. Before changing to a different non-embedding model, switch the
-resident model through the lab control plane:
-
-```sh
-./scripts/lab switch coder
-```
+Use one endpoint and send the desired catalog alias directly in each request.
+No manual switch is required:
 
 ```js
 import OpenAI from "openai";
@@ -103,12 +101,6 @@ await client.chat.completions.create({
   model: "coder-30b",
   messages: [{ role: "user", content: "Review this function." }],
 });
-```
-
-For another non-embedding model, switch first, then use that alias:
-
-```sh
-./scripts/lab switch reason
 ```
 
 ```js
@@ -156,10 +148,10 @@ source, last verification, and agent compatibility. See
 [docs/model-fleet.md](docs/model-fleet.md) for lifecycle and admission rules.
 
 By default, `server.models_autoload` is `false` and `server.models_max` is
-`null`. The wrapper then starts llama.cpp with enough capacity for one
-non-embedding model plus all configured embedding models, and the wrapper does
-the unload-then-load switch before requests. That avoids direct router autoloads
-leaving multiple chat/reasoning/coding models resident.
+`null`. The gateway listens on port 8080 and runs llama.cpp privately on port
+8081 with enough capacity for one non-embedding model plus configured embedding
+models. It serializes unload/load transitions, holds requests until the alias is
+ready, and unloads idle generation models after 15 minutes.
 
 Render the generated llama.cpp preset after changes:
 
@@ -237,6 +229,17 @@ Manual model management:
 `load` and `switch` are equivalent for residency: if another non-embedding model
 is active, it is unloaded before the requested non-embedding model is loaded.
 Embedding models are exempt from that eviction rule and can stay loaded.
+
+Normal operation is `cline` mode: JIT loading and idle unload are enabled. For
+reproducible experiments, explicitly pin a model before the run:
+
+```sh
+./scripts/lab mode benchmark fast-9b
+./scripts/lab bench-server fast
+./scripts/lab mode cline
+```
+
+Benchmark mode rejects automatic switching to any alias other than its pin.
 
 Quick smoke chat:
 
