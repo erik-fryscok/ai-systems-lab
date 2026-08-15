@@ -34,6 +34,15 @@ import skill_eval
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from ai_systems_lab.providers import (
+    ProviderConfigError,
+    resolve_model_target,
+    validate_provider_config,
+)
+
 DEFAULT_CONFIG = REPO_ROOT / "config" / "lab.json"
 SERVICE_LABEL = "com.erik.local-ai-lab"
 SERVICE_STATE_DIR = Path.home() / "Library" / "Application Support" / SERVICE_LABEL
@@ -330,6 +339,20 @@ def api_base(cfg):
     return f"http://{server.get('host', '127.0.0.1')}:{server.get('port', 8080)}"
 
 
+def model_target(cfg, model_id):
+    return resolve_model_target(cfg, model_id, f"{api_base(cfg)}/v1")
+
+
+def require_local_model(cfg, model_id, operation):
+    target = model_target(cfg, model_id)
+    if not target.is_local:
+        raise LabError(
+            f"{operation} requires a local llama.cpp model; "
+            f"'{model_id}' uses provider '{target.provider}'"
+        )
+    return target
+
+
 def router_models_max(cfg):
     value = cfg.get("server", {}).get("models_max")
     if value in (None, "auto"):
@@ -605,6 +628,7 @@ CATALOG_REQUIRED_FIELDS = {
 
 
 def validate_catalog_config(cfg):
+    validate_provider_config(cfg)
     errors = []
     for section in ["models", "watchlist"]:
         for model_id, entry in cfg.get(section, {}).items():
@@ -619,7 +643,7 @@ def validate_catalog_config(cfg):
                 errors.append(f"{model_id}: agent_compatibility must be an object")
             if section == "models":
                 preset_context = entry.get("preset", {}).get("ctx-size")
-                if preset_context != entry.get("context_tokens"):
+                if model_target(cfg, model_id).is_local and preset_context != entry.get("context_tokens"):
                     errors.append(
                         f"{model_id}: context_tokens {entry.get('context_tokens')} "
                         f"does not match preset ctx-size {preset_context}"
@@ -642,11 +666,13 @@ def catalog_rows(cfg, role=None, status=None):
             continue
         if status and entry.get("status") != status:
             continue
-        files = model_weight_paths(cfg, model_id) if runnable else []
-        installed = bool(files) and all(path.exists() for path in files)
+        target = model_target(cfg, model_id) if runnable else None
+        local = target is not None and target.is_local
+        files = model_weight_paths(cfg, model_id) if local else []
+        installed = bool(files) and all(path.exists() for path in files) if local else None
         installed_bytes = sum(path.stat().st_size for path in files if path.exists())
         partial_bytes = 0
-        if runnable:
+        if local:
             local_dir = model_local_dir(cfg, model_id)
             if local_dir.exists():
                 partial_bytes = sum(
@@ -671,6 +697,9 @@ def catalog_rows(cfg, role=None, status=None):
             "official_model_id": entry.get("official_model_id"),
             "source_url": entry.get("source_url"),
             "agent_compatibility": entry.get("agent_compatibility", {}),
+            "provider": target.provider if target else None,
+            "provider_type": target.provider_type if target else None,
+            "availability": "local" if local else "remote" if runnable else "watchlist",
         })
     return rows
 
@@ -692,7 +721,7 @@ def cmd_catalog(args, cfg):
     if not rows:
         print("No catalog entries matched the requested filters.")
         return
-    headers = ["MODEL", "STATUS", "ROLES", "QUANT", "PARAMS", "DISK", "INSTALLED", "VERIFIED"]
+    headers = ["MODEL", "PROVIDER", "STATUS", "ROLES", "QUANT", "PARAMS", "DISK", "AVAILABLE", "VERIFIED"]
     table_rows = []
     for row in rows:
         total = row["parameters_total_b"]
@@ -704,20 +733,25 @@ def cmd_catalog(args, cfg):
                 params += f"/{active:g}B active"
         expected = row["expected_disk_gib"]
         disk = f"{expected:g} GiB" if expected is not None else "?"
-        if row["installed"]:
-            installed = f"yes ({row['installed_gib']:g} GiB)"
+        if row["availability"] == "remote":
+            available = "remote"
+        elif row["availability"] == "watchlist":
+            available = "watchlist"
+        elif row["installed"]:
+            available = f"yes ({row['installed_gib']:g} GiB)"
         elif row["partial_gib"]:
-            installed = f"partial ({row['partial_gib']:g} GiB)"
+            available = f"partial ({row['partial_gib']:g} GiB)"
         else:
-            installed = "no"
+            available = "no"
         table_rows.append([
             row["model"],
+            row["provider"] or "-",
             row["status"],
             ",".join(row["roles"]) or "-",
             row["quantization"] or "-",
             params,
             disk,
-            installed,
+            available,
             row["last_verified"] or "-",
         ])
     widths = [
@@ -759,6 +793,7 @@ def validate_pull_capacity(cfg, model_ids):
 
 
 def pull_one(cfg, model_id, dry_run=False, force=False):
+    require_local_model(cfg, model_id, "pull")
     entry = model_entry(cfg, model_id)
     if entry.get("status") == "retired":
         raise LabError(
@@ -961,6 +996,7 @@ class Gateway:
         raise LabError(f"model {model_id} did not unload within 300s")
 
     def ensure_model(self, model_id):
+        require_local_model(self.cfg, model_id, "gateway loading")
         entry = model_entry(self.cfg, model_id)
         if entry.get("status") == "retired":
             raise LabError(f"{model_id} is retired and cannot be loaded")
@@ -1752,6 +1788,7 @@ def switch_to_model(cfg, model_id, timeout=900):
 
 def cmd_load(args, cfg):
     model_id = resolve_selector(cfg, args.selector)
+    require_local_model(cfg, model_id, "load")
     if not is_embedding_model(cfg, model_id):
         update_service_state(manual_unloaded=False)
     if not api_is_ready(cfg):
@@ -1764,11 +1801,14 @@ def cmd_load(args, cfg):
 
 
 def cmd_switch(args, cfg):
+    model_id = resolve_selector(cfg, args.selector)
+    require_local_model(cfg, model_id, "switch")
     cmd_load(args, cfg)
 
 
 def cmd_unload(args, cfg):
     model_id = resolve_selector(cfg, args.selector)
+    require_local_model(cfg, model_id, "unload")
     if not is_embedding_model(cfg, model_id):
         update_service_state(manual_unloaded=True)
     unload_model(cfg, model_id, quiet=False)
@@ -2195,6 +2235,7 @@ def _cmd_skill_run(args, cfg, redteam):
 
 def cmd_verify(args, cfg):
     model_id = resolve_selector(cfg, args.selector)
+    require_local_model(cfg, model_id, "verify")
     if is_embedding_model(cfg, model_id):
         raise LabError("verify currently exercises chat and tool calls; use it with a non-embedding model.")
     model_files = model_weight_paths(cfg, model_id)
@@ -2424,9 +2465,11 @@ def write_metadata(cfg, out_dir, command_kind, extra=None):
 
 
 def cmd_bench_llama(args, cfg):
+    model_ids = selector_models(cfg, args.selector, all_candidates=args.all_candidates)
+    for model_id in model_ids:
+        require_local_model(cfg, model_id, "bench-llama")
     binary = cfg.get("benchmarks", {}).get("llama_bench_binary", "llama-bench")
     require_binary(binary)
-    model_ids = selector_models(cfg, args.selector, all_candidates=args.all_candidates)
     model_ids = require_model_files(cfg, model_ids, args.selector, skip_missing=args.skip_missing)
     out_dir = paths(cfg)["results_dir"] / f"{now_stamp()}-llama-bench-{args.selector}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -2817,7 +2860,8 @@ def local_score_response(cfg, judge_cfg, eval_payload):
     model_id = judge_cfg.get("model")
     if not model_id:
         raise LabError("--judge-model is required when --judge-provider local.")
-    resolve_selector(cfg, model_id)
+    model_id = resolve_selector(cfg, model_id)
+    require_local_model(cfg, model_id, "local judge")
     switch_to_model(cfg, model_id, timeout=judge_cfg["timeout_seconds"])
     prompt = {
         "messages": [
@@ -2938,6 +2982,7 @@ def cmd_bench_quality(args, cfg):
         if not judge_model:
             raise LabError("--judge-model is required when --judge-provider local.")
         judge_model = resolve_selector(cfg, judge_model)
+        require_local_model(cfg, judge_model, "local judge")
         judge_cfg["model"] = judge_model
         if judge_model in model_ids:
             raise LabError("The local judge model must be different from every candidate model.")
@@ -3411,7 +3456,7 @@ def main():
     except subprocess.CalledProcessError as exc:
         print(f"command failed with exit {exc.returncode}: {command_to_string(exc.cmd)}", file=sys.stderr)
         return exc.returncode
-    except LabError as exc:
+    except (LabError, ProviderConfigError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     return 0

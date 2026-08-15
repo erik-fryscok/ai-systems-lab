@@ -11,6 +11,8 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
+from ai_systems_lab.providers import ProviderConfigError
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LOADER = importlib.machinery.SourceFileLoader("local_ai_lab", str(REPO_ROOT / "scripts" / "lab"))
@@ -128,6 +130,7 @@ class SkillEvalCommandTests(unittest.TestCase):
         self.skill_dir = REPO_ROOT / "tests" / "fixtures" / "skill-project" / "skills" / "safe-skill"
         self.eval_dir = REPO_ROOT / "tests" / "fixtures" / "skill-project" / ".skill-evals" / "safe-skill"
         self.config = {
+            "providers": {"local": {"type": "llama_cpp"}},
             "paths": {
                 "models_dir": str(self.root / "models"),
                 "state_dir": str(self.root / "state"),
@@ -135,6 +138,7 @@ class SkillEvalCommandTests(unittest.TestCase):
             "server": {"host": "127.0.0.1", "port": 8080},
             "models": {
                 "fast-9b": {
+                    "provider": "local",
                     "context_tokens": 32768,
                     "files": ["fast.gguf"],
                     "local_dir": "fast-9b",
@@ -412,9 +416,11 @@ class SkillEvalCommandTests(unittest.TestCase):
 class CatalogTests(unittest.TestCase):
     def test_catalog_filters_watchlist_by_role_and_status(self):
         config = {
+            "providers": {"local": {"type": "llama_cpp"}},
             "paths": {"models_dir": "/tmp/models"},
             "models": {
                 "fast": {
+                    "provider": "local",
                     "roles": ["utility"],
                     "status": "core",
                     "files": ["fast.gguf"],
@@ -435,10 +441,12 @@ class CatalogTests(unittest.TestCase):
 
     def test_pull_capacity_rejects_projected_overage(self):
         config = {
+            "providers": {"local": {"type": "llama_cpp"}},
             "paths": {"models_dir": "/tmp/models"},
             "fleet": {"installed_weight_cap_gib": 10},
             "models": {
                 "candidate": {
+                    "provider": "local",
                     "roles": ["utility"],
                     "status": "candidate",
                     "files": ["candidate.gguf"],
@@ -467,10 +475,12 @@ class CatalogTests(unittest.TestCase):
             with complete.open("wb") as file_handle:
                 file_handle.truncate(256 * 1024 * 1024)
             config = {
+                "providers": {"local": {"type": "llama_cpp"}},
                 "paths": {"models_dir": directory},
                 "fleet": {"installed_weight_cap_gib": 1.1},
                 "models": {
                     "candidate": {
+                        "provider": "local",
                         "roles": ["utility"],
                         "status": "candidate",
                         "local_dir": "candidate",
@@ -491,6 +501,7 @@ class CatalogTests(unittest.TestCase):
     def test_catalog_validation_rejects_context_mismatch(self):
         entry = {field: None for field in lab.CATALOG_REQUIRED_FIELDS}
         entry.update({
+            "provider": "local",
             "roles": ["utility"],
             "status": "candidate",
             "agent_compatibility": {},
@@ -499,7 +510,64 @@ class CatalogTests(unittest.TestCase):
         })
 
         with self.assertRaisesRegex(lab.LabError, "does not match preset ctx-size"):
-            lab.validate_catalog_config({"models": {"candidate": entry}})
+            lab.validate_catalog_config({
+                "providers": {"local": {"type": "llama_cpp"}},
+                "models": {"candidate": entry},
+            })
+
+
+class ProviderCatalogTests(unittest.TestCase):
+    def test_cloud_catalog_entry_does_not_require_local_preset_or_weight_files(self):
+        config = {
+            "providers": {
+                "cloud": {
+                    "type": "openai_compatible",
+                    "base_url": "https://api.example.test/v1",
+                    "api_key_env": "EXAMPLE_AI_API_KEY",
+                }
+            },
+            "models": {
+                "cloud-coder": {
+                    "provider": "cloud",
+                    "provider_model": "vendor/coder-v1",
+                    "release_date": "2026-01",
+                    "official_model_id": "vendor/coder-v1",
+                    "architecture": "hosted",
+                    "parameters_total_b": None,
+                    "parameters_active_b": None,
+                    "quantization": None,
+                    "license": "provider terms",
+                    "roles": ["coding"],
+                    "status": "candidate",
+                    "expected_disk_gib": None,
+                    "context_tokens": 32768,
+                    "source_url": "https://example.test/models/coder-v1",
+                    "last_verified": None,
+                    "agent_compatibility": {},
+                }
+            },
+        }
+        lab.validate_catalog_config(config)
+        row = lab.catalog_rows(config)[0]
+        self.assertEqual(row["provider"], "cloud")
+        self.assertEqual(row["provider_type"], "openai_compatible")
+        self.assertEqual(row["availability"], "remote")
+        self.assertIsNone(row["installed"])
+
+    def test_local_only_command_rejects_cloud_model_before_side_effects(self):
+        config = {
+            "server": {"host": "127.0.0.1", "port": 8080},
+            "providers": {
+                "cloud": {
+                    "type": "openai_compatible",
+                    "base_url": "https://api.example.test/v1",
+                    "api_key_env": "EXAMPLE_AI_API_KEY",
+                }
+            },
+            "models": {"cloud-coder": {"provider": "cloud"}},
+        }
+        with self.assertRaisesRegex(lab.LabError, "load requires a local llama.cpp model"):
+            lab.require_local_model(config, "cloud-coder", "load")
 
 
 class QualityTests(unittest.TestCase):
@@ -576,12 +644,14 @@ class VerificationTests(unittest.TestCase):
     def test_missing_model_fails_before_service_state_changes(self):
         with tempfile.TemporaryDirectory() as directory:
             config = {
+                "providers": {"local": {"type": "llama_cpp"}},
                 "paths": {
                     "models_dir": directory,
                     "results_dir": str(Path(directory) / "results"),
                 },
                 "models": {
                     "missing": {
+                        "provider": "local",
                         "files": ["missing.gguf"],
                         "local_dir": "missing",
                         "preset": {},
@@ -600,9 +670,10 @@ class VerificationTests(unittest.TestCase):
 class BenchmarkModelSessionTests(unittest.TestCase):
     def setUp(self):
         self.config = {
+            "providers": {"local": {"type": "llama_cpp"}},
             "models": {
-                "fast-9b": {"roles": ["utility"]},
-                "previous-13b": {"roles": ["coding"]},
+                "fast-9b": {"provider": "local", "roles": ["utility"]},
+                "previous-13b": {"provider": "local", "roles": ["coding"]},
             }
         }
         self.snapshot = {
@@ -724,9 +795,11 @@ class BenchmarkModelSessionTests(unittest.TestCase):
                 model_dir.mkdir(parents=True)
                 (model_dir / f"{model_id}.gguf").touch()
             config = {
+                "providers": {"local": {"type": "llama_cpp"}},
                 "paths": {"models_dir": str(models_dir), "state_dir": str(Path(directory) / "runtime")},
                 "models": {
                     model_id: {
+                        "provider": "local",
                         "files": [f"{model_id}.gguf"],
                         "local_dir": model_id,
                         "preset": {},
@@ -773,9 +846,11 @@ class BenchmarkModelSessionTests(unittest.TestCase):
             model_dir.mkdir(parents=True)
             (model_dir / "fast-9b.gguf").touch()
             config = {
+                "providers": {"local": {"type": "llama_cpp"}},
                 "paths": {"models_dir": str(models_dir), "state_dir": str(Path(directory) / "runtime")},
                 "models": {
                     "fast-9b": {
+                        "provider": "local",
                         "files": ["fast-9b.gguf"],
                         "local_dir": "fast-9b",
                         "preset": {},
@@ -841,8 +916,9 @@ class GatewayTests(unittest.TestCase):
             model_dir.mkdir()
             (model_dir / "fast.gguf").touch()
             config = {
+                "providers": {"local": {"type": "llama_cpp"}},
                 "paths": {"state_dir": ".local-ai-lab", "models_dir": directory},
-                "models": {"fast": {"status": "core", "files": ["fast.gguf"], "local_dir": "fast"}},
+                "models": {"fast": {"provider": "local", "status": "core", "files": ["fast.gguf"], "local_dir": "fast"}},
             }
             lab.save_service_state({
                 "auto_idle_enabled": True,
