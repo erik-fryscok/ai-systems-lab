@@ -15,10 +15,125 @@ from ai_systems_lab.providers import ProviderConfigError
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-LOADER = importlib.machinery.SourceFileLoader("local_ai_lab", str(REPO_ROOT / "scripts" / "lab"))
+LOADER = importlib.machinery.SourceFileLoader("ai_systems_lab_cli", str(REPO_ROOT / "scripts" / "lab"))
 SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
 lab = importlib.util.module_from_spec(SPEC)
 LOADER.exec_module(lab)
+
+
+class IdentityMigrationTests(unittest.TestCase):
+    def test_new_environment_name_wins_over_legacy_name(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "AI_SYSTEMS_LAB_CONFIG": "/new/config.json",
+                "LOCAL_AI_LAB_CONFIG": "/legacy/config.json",
+            },
+            clear=False,
+        ):
+            self.assertEqual(lab.project_env("CONFIG"), "/new/config.json")
+
+    def test_legacy_environment_name_remains_a_read_fallback(self):
+        with mock.patch.dict(
+            os.environ,
+            {"LOCAL_AI_LAB_CONFIG": "/legacy/config.json"},
+            clear=True,
+        ):
+            self.assertEqual(lab.project_env("CONFIG"), "/legacy/config.json")
+
+    def test_existing_legacy_models_directory_is_used_when_new_directory_is_absent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            legacy = root / "local-ai-lab"
+            legacy.mkdir()
+            config = {
+                "paths": {
+                    "models_dir": str(root / "ai-systems-lab"),
+                    "legacy_models_dir": str(legacy),
+                }
+            }
+            self.assertEqual(lab.paths(config)["models_dir"], legacy.resolve())
+
+    def test_new_service_identity_is_used_for_writes(self):
+        self.assertEqual(lab.SERVICE_LABEL, "com.erik.ai-systems-lab")
+        self.assertEqual(lab.LEGACY_SERVICE_LABEL, "com.erik.local-ai-lab")
+
+    def test_offline_server_message_uses_new_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model_path = root / "model.gguf"
+            model_path.touch()
+            config = {
+                "providers": {"local": {"type": "llama_cpp"}},
+                "server": {},
+                "paths": {"models_dir": str(root)},
+                "models": {
+                    "model": {
+                        "provider": "local",
+                        "files": ["model.gguf"],
+                        "local_dir": ".",
+                    }
+                },
+            }
+            launch_agent_path = mock.Mock()
+            launch_agent_path.exists.return_value = False
+            with mock.patch.object(lab, "update_service_state"), mock.patch.object(
+                lab, "api_is_ready", return_value=False
+            ), mock.patch.object(lab, "LAUNCH_AGENT_PATH", launch_agent_path):
+                with self.assertRaisesRegex(lab.LabError, "AI Systems Lab server is offline"):
+                    lab.cmd_load(Namespace(selector="model", timeout=1), config)
+
+    def test_legacy_state_is_read_only_when_new_state_is_absent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            new_path = root / "new" / "state.json"
+            legacy_path = root / "legacy" / "state.json"
+            legacy_path.parent.mkdir()
+            legacy_path.write_text(json.dumps({"auto_idle_seconds": 120}), encoding="utf-8")
+            with mock.patch.object(lab, "SERVICE_STATE_PATH", new_path), mock.patch.object(
+                lab, "LEGACY_SERVICE_STATE_PATH", legacy_path
+            ):
+                self.assertEqual(lab.load_service_state()["auto_idle_seconds"], 120)
+                self.assertFalse(new_path.exists())
+                lab.save_service_state(lab.load_service_state())
+            self.assertTrue(new_path.exists())
+            self.assertTrue(legacy_path.exists())
+
+    def test_service_install_rejects_legacy_plist_before_stopping_anything(self):
+        legacy_path = mock.Mock()
+        legacy_path.exists.return_value = True
+        with mock.patch.object(lab, "LEGACY_LAUNCH_AGENT_PATH", legacy_path), mock.patch.object(
+            lab, "service_is_legacy_loaded"
+        ) as legacy_loaded, mock.patch.object(lab, "stop_ad_hoc_server") as stop_server:
+            with self.assertRaisesRegex(lab.LabError, "service-uninstall-legacy"):
+                lab.cmd_service_install(Namespace(wait=15, force=False, startup_wait=180), {"models": {}})
+        legacy_loaded.assert_not_called()
+        stop_server.assert_not_called()
+
+    def test_service_install_rejects_active_legacy_service_without_plist(self):
+        legacy_path = mock.Mock()
+        legacy_path.exists.return_value = False
+        with mock.patch.object(lab, "LEGACY_LAUNCH_AGENT_PATH", legacy_path), mock.patch.object(
+            lab, "service_is_legacy_loaded", return_value=True
+        ), mock.patch.object(lab, "stop_ad_hoc_server") as stop_server:
+            with self.assertRaisesRegex(lab.LabError, "com\\.erik\\.local-ai-lab"):
+                lab.cmd_service_install(Namespace(wait=15, force=False, startup_wait=180), {"models": {}})
+        stop_server.assert_not_called()
+
+    def test_legacy_service_uninstall_only_boots_out_legacy_target_and_unlinks_legacy_plist(self):
+        legacy_path = mock.Mock()
+        legacy_path.exists.return_value = True
+        output = io.StringIO()
+        with mock.patch.object(lab, "LEGACY_LAUNCH_AGENT_PATH", legacy_path), mock.patch.object(
+            lab.subprocess, "run"
+        ) as run, redirect_stdout(output):
+            lab.cmd_service_uninstall_legacy(Namespace(), {})
+
+        run.assert_called_once_with(
+            ["launchctl", "bootout", f"gui/{os.getuid()}/com.erik.local-ai-lab"], check=False
+        )
+        legacy_path.unlink.assert_called_once_with()
+        self.assertIn("legacy service removed: com.erik.local-ai-lab", output.getvalue())
 
 
 class ConfigTests(unittest.TestCase):

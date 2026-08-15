@@ -46,10 +46,18 @@ from ai_systems_lab.providers import (
 )
 
 DEFAULT_CONFIG = REPO_ROOT / "config" / "lab.json"
-SERVICE_LABEL = "com.erik.local-ai-lab"
+SERVICE_LABEL = "com.erik.ai-systems-lab"
+LEGACY_SERVICE_LABEL = "com.erik.local-ai-lab"
 SERVICE_STATE_DIR = Path.home() / "Library" / "Application Support" / SERVICE_LABEL
+LEGACY_SERVICE_STATE_PATH = (
+    Path.home() / "Library" / "Application Support" / LEGACY_SERVICE_LABEL / "state.json"
+)
 SERVICE_STATE_PATH = SERVICE_STATE_DIR / "state.json"
 LAUNCH_AGENT_PATH = Path.home() / "Library" / "LaunchAgents" / f"{SERVICE_LABEL}.plist"
+LEGACY_LAUNCH_AGENT_PATH = (
+    Path.home() / "Library" / "LaunchAgents" / f"{LEGACY_SERVICE_LABEL}.plist"
+)
+_LEGACY_MODELS_WARNINGS = set()
 DEFAULT_SERVICE_STATE = {
     "auto_idle_enabled": True,
     "auto_idle_seconds": 900,
@@ -106,11 +114,17 @@ def deep_merge(base, overlay):
     return merged
 
 
+def project_env(suffix):
+    return os.environ.get(f"AI_SYSTEMS_LAB_{suffix}") or os.environ.get(
+        f"LOCAL_AI_LAB_{suffix}"
+    )
+
+
 def load_config(path):
     config_path = Path(path).expanduser().resolve()
     with open(config_path, "r", encoding="utf-8") as handle:
         cfg = json.load(handle)
-    configured_overlay = os.environ.get("LOCAL_AI_LAB_LOCAL_CONFIG")
+    configured_overlay = project_env("LOCAL_CONFIG")
     local_config_path = (
         Path(configured_overlay).expanduser().resolve()
         if configured_overlay
@@ -126,20 +140,23 @@ def load_config(path):
 
 
 def service_state_path():
-    override = os.environ.get("LOCAL_AI_LAB_STATE_PATH")
+    override = project_env("STATE_PATH")
     return Path(override).expanduser().resolve() if override else SERVICE_STATE_PATH
 
 
 def load_service_state():
     state = dict(DEFAULT_SERVICE_STATE)
     path = service_state_path()
-    if path.exists():
+    read_path = path
+    if path == SERVICE_STATE_PATH and not path.exists() and LEGACY_SERVICE_STATE_PATH.exists():
+        read_path = LEGACY_SERVICE_STATE_PATH
+    if read_path.exists():
         try:
-            stored = json.loads(path.read_text(encoding="utf-8"))
+            stored = json.loads(read_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            raise LabError(f"Invalid service state at {path}: {exc}") from exc
+            raise LabError(f"Invalid service state at {read_path}: {exc}") from exc
         if not isinstance(stored, dict):
-            raise LabError(f"Invalid service state at {path}: expected a JSON object")
+            raise LabError(f"Invalid service state at {read_path}: expected a JSON object")
         state.update({key: stored[key] for key in DEFAULT_SERVICE_STATE if key in stored})
     state["auto_idle_enabled"] = bool(state["auto_idle_enabled"])
     state["manual_unloaded"] = bool(state["manual_unloaded"])
@@ -175,14 +192,14 @@ def runtime_config(cfg, state=None):
     state = state or load_service_state()
     effective = copy.deepcopy(cfg)
     idle_seconds = state["auto_idle_seconds"]
-    test_override = os.environ.get("LOCAL_AI_LAB_IDLE_SECONDS_OVERRIDE")
+    test_override = project_env("IDLE_SECONDS_OVERRIDE")
     if test_override:
         try:
             idle_seconds = int(test_override)
         except ValueError as exc:
-            raise LabError("LOCAL_AI_LAB_IDLE_SECONDS_OVERRIDE must be an integer") from exc
+            raise LabError("AI_SYSTEMS_LAB_IDLE_SECONDS_OVERRIDE must be an integer") from exc
         if idle_seconds <= 0:
-            raise LabError("LOCAL_AI_LAB_IDLE_SECONDS_OVERRIDE must be greater than zero")
+            raise LabError("AI_SYSTEMS_LAB_IDLE_SECONDS_OVERRIDE must be greater than zero")
     # The gateway, not llama.cpp, performs unload-on-idle. llama.cpp sleep
     # leaves weights resident, which is not the intended Cline behavior.
     effective["server"]["sleep_idle_seconds"] = None
@@ -203,9 +220,22 @@ def repo_path(value):
 
 def paths(cfg):
     raw = cfg.get("paths", {})
+    models_dir = repo_path(raw.get("models_dir", "~/Models/ai-systems-lab"))
+    legacy_models_dir = raw.get("legacy_models_dir")
+    if not models_dir.exists() and legacy_models_dir:
+        legacy_path = repo_path(legacy_models_dir)
+        warning_key = (models_dir, legacy_path)
+        if legacy_path.exists():
+            if warning_key not in _LEGACY_MODELS_WARNINGS:
+                print(
+                    f"warning: using legacy models directory {legacy_path}; configure models_dir to migrate",
+                    file=sys.stderr,
+                )
+                _LEGACY_MODELS_WARNINGS.add(warning_key)
+            models_dir = legacy_path
     return {
-        "models_dir": repo_path(raw.get("models_dir", "~/Models/local-ai-lab")),
-        "state_dir": repo_path(raw.get("state_dir", ".local-ai-lab")),
+        "models_dir": models_dir,
+        "state_dir": repo_path(raw.get("state_dir", ".ai-systems-lab")),
         "generated_dir": repo_path(raw.get("generated_dir", "config/generated")),
         "results_dir": repo_path(raw.get("results_dir", "benchmarks/results")),
     }
@@ -883,9 +913,22 @@ def service_target():
     return f"gui/{os.getuid()}/{SERVICE_LABEL}"
 
 
+def legacy_service_target():
+    return f"gui/{os.getuid()}/{LEGACY_SERVICE_LABEL}"
+
+
 def service_is_loaded():
     result = subprocess.run(
         ["launchctl", "print", service_target()],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
+def service_is_legacy_loaded():
+    result = subprocess.run(
+        ["launchctl", "print", legacy_service_target()],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -1134,7 +1177,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(data)
 
     def _stable_models(self):
-        data = [{"id": model_id, "object": "model", "owned_by": "local-ai-lab"}
+        data = [{"id": model_id, "object": "model", "owned_by": "ai-systems-lab"}
                 for model_id, entry in sorted(self.server.gateway.cfg.get("models", {}).items())
                 if entry.get("status") != "retired"]
         body = json.dumps({"object": "list", "data": data}).encode()
@@ -1327,13 +1370,19 @@ def restart_service(cfg, wait=120):
 
 
 def cmd_service_install(args, cfg):
+    if LEGACY_LAUNCH_AGENT_PATH.exists() or service_is_legacy_loaded():
+        raise LabError(
+            "Legacy com.erik.local-ai-lab service is still installed. "
+            "Run './scripts/lab service-uninstall-legacy' before installing "
+            "com.erik.ai-systems-lab."
+        )
     validate_startup_models(runtime_config(cfg))
     if service_is_loaded():
         bootout_service()
         time.sleep(0.5)
     stopped = stop_ad_hoc_server(cfg, wait=args.wait, force=args.force)
     if stopped:
-        print("stopped existing local-ai-lab server: " + ", ".join(str(pid) for pid in stopped))
+        print("stopped existing ai-systems-lab server: " + ", ".join(str(pid) for pid in stopped))
     path = write_launch_agent(cfg)
     bootstrap_service(cfg, wait=args.startup_wait)
     print(f"LaunchAgent installed and running: {path}")
@@ -1368,6 +1417,14 @@ def cmd_service_uninstall(args, cfg):
     LAUNCH_AGENT_PATH.unlink(missing_ok=True)
     state_file(cfg, "server.pid").unlink(missing_ok=True)
     print(f"LaunchAgent uninstalled: {LAUNCH_AGENT_PATH}")
+
+
+def cmd_service_uninstall_legacy(args, cfg):
+    target = f"gui/{os.getuid()}/{LEGACY_SERVICE_LABEL}"
+    subprocess.run(["launchctl", "bootout", target], check=False)
+    if LEGACY_LAUNCH_AGENT_PATH.exists():
+        LEGACY_LAUNCH_AGENT_PATH.unlink()
+    print(f"legacy service removed: {LEGACY_SERVICE_LABEL}")
 
 
 def cmd_serve(args, cfg):
@@ -1828,7 +1885,7 @@ def cmd_load(args, cfg):
         if LAUNCH_AGENT_PATH.exists():
             bootstrap_service(cfg, wait=args.timeout)
         else:
-            raise LabError("Local AI server is offline. Run 'make start' or 'make service-install' first.")
+            raise LabError("AI Systems Lab server is offline. Run 'make start' or 'make service-install' first.")
     response = switch_to_model(cfg, model_id, timeout=args.timeout)
     print(json.dumps(response, indent=2))
 
@@ -1891,7 +1948,7 @@ def cmd_mode(args, cfg):
     require_local_model(cfg, model_id, "mode")
     state = load_service_state()
     if not api_is_ready(cfg):
-        raise LabError("Local AI server is offline. Run 'make start' first.")
+        raise LabError("AI Systems Lab server is offline. Run 'make start' first.")
     switch_to_model(cfg, model_id, timeout=args.timeout)
     state.update({"mode": "benchmark", "pinned_model": model_id, "manual_unloaded": False})
     save_service_state(state)
@@ -1908,7 +1965,7 @@ def cmd_chat(args, cfg):
             if LAUNCH_AGENT_PATH.exists():
                 bootstrap_service(cfg, wait=args.timeout)
             else:
-                raise LabError("Local AI server is offline. Run 'make start' or 'make service-install' first.")
+                raise LabError("AI Systems Lab server is offline. Run 'make start' or 'make service-install' first.")
     result = chat_completion(
         cfg,
         model_id,
@@ -2315,7 +2372,7 @@ def cmd_verify(args, cfg):
                 bootstrap_service(cfg, wait=args.timeout)
             else:
                 raise LabError(
-                    "Local AI server is offline. Run 'make start' or "
+                    "AI Systems Lab server is offline. Run 'make start' or "
                     "'make service-install' first."
                 )
         load_response = switch_to_model(cfg, model_id, timeout=args.timeout)
@@ -3301,8 +3358,8 @@ def cmd_export_public(args, cfg):
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="Local llama.cpp lab orchestration.")
-    parser.add_argument("--config", default=os.environ.get("LOCAL_AI_LAB_CONFIG", str(DEFAULT_CONFIG)))
+    parser = argparse.ArgumentParser(description="AI Systems Lab llama.cpp orchestration.")
+    parser.add_argument("--config", default=project_env("CONFIG") or str(DEFAULT_CONFIG))
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("doctor")
@@ -3351,6 +3408,7 @@ def build_parser():
     service_status.add_argument("--format", choices=["text", "raycast", "json"], default="text")
 
     sub.add_parser("service-uninstall")
+    sub.add_parser("service-uninstall-legacy")
 
     auto_idle = sub.add_parser("auto-idle")
     auto_idle.add_argument("action", choices=["on", "off", "toggle", "status"])
@@ -3472,6 +3530,7 @@ COMMANDS = {
     "service-restart": cmd_service_restart,
     "service-status": cmd_status,
     "service-uninstall": cmd_service_uninstall,
+    "service-uninstall-legacy": cmd_service_uninstall_legacy,
     "auto-idle": cmd_auto_idle,
     "mode": cmd_mode,
     "logs": cmd_logs,
