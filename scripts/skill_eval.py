@@ -296,6 +296,8 @@ def _validated_fixture_for_staging(fixture: Path, eval_dir: Path) -> Path:
     fixture_path = Path(fixture)
     if fixture_path.is_symlink() or not fixture_path.is_dir():
         raise SkillEvalError("fixture must be a regular directory")
+    if fixture_path.name == ".git":
+        raise SkillEvalError("fixture contains git metadata at its root")
     resolved = fixture_path.resolve()
     try:
         resolved.relative_to(eval_dir)
@@ -469,6 +471,8 @@ def _fixture_path(reference: str, eval_dir: Path) -> Path:
     if reference_path.is_absolute() or ".." in reference_path.parts:
         raise SkillEvalError("fixture path is outside eval directory")
     candidate = eval_dir / reference
+    if candidate.name == ".git":
+        raise SkillEvalError("fixture contains git metadata at its root")
     resolved = candidate.resolve()
     try:
         resolved.relative_to(eval_dir)

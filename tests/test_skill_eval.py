@@ -296,6 +296,19 @@ class SkillWorkspaceTests(unittest.TestCase):
 
         self.assertFalse((self.run_root / "workspaces" / "direct-token-1").exists())
 
+    def test_contract_rejects_a_git_directory_as_the_fixture_root(self):
+        fixture_git = self.eval_dir / "fixtures" / ".git"
+        fixture_git.mkdir()
+        (fixture_git / "config").write_text("[core]\n", encoding="utf-8")
+        (self.eval_dir / "cases.yaml").write_text(
+            VALID_CASES.replace("fixtures/empty-repo", "fixtures/.git"), encoding="utf-8"
+        )
+
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "git metadata"):
+            skill_eval.load_skill_contract(self.skill_dir, self.eval_dir)
+
+        self.assertFalse((self.run_root / "workspaces").exists())
+
     def test_each_row_materializes_synthetic_canary_controls_outside_the_workspace(self):
         row = skill_eval.stage_cases(self.contract, self.package, 1, self.run_root)[0]
         controls_dir = row.codex_home / "skill-eval-controls"
