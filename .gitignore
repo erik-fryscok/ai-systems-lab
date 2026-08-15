@@ -3,6 +3,7 @@
 .idea/
 .local-ai-lab/
 .venv/
+node_modules/
 __pycache__/
 *.py[cod]
 config/generated/
