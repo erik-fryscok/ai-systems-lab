@@ -19,6 +19,71 @@ LOADER.exec_module(lab)
 
 
 class ConfigTests(unittest.TestCase):
+    def test_skill_eval_dependencies_require_project_promptfoo(self):
+        with mock.patch.object(lab, "which", return_value=None):
+            with self.assertRaisesRegex(lab.LabError, "npm ci"):
+                lab.require_skill_eval_dependencies()
+
+    def test_skill_eval_dependencies_reject_nested_sdk_version_mismatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "package-lock.json").write_text(
+                json.dumps(
+                    {
+                        "packages": {
+                            "node_modules/@openai/codex-sdk": {"version": "0.147.0"},
+                            "node_modules/promptfoo/node_modules/@openai/codex-sdk": {
+                                "version": "0.144.6"
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            promptfoo = root / "node_modules" / ".bin" / "promptfoo"
+            with mock.patch.object(lab, "REPO_ROOT", root), mock.patch.object(
+                lab, "which", return_value=str(promptfoo)
+            ):
+                with self.assertRaisesRegex(lab.LabError, "npm ci"):
+                    lab.require_skill_eval_dependencies()
+
+    def test_responses_preflight_reports_incompatible_server(self):
+        with mock.patch.object(
+            lab,
+            "json_request",
+            side_effect=lab.LabHttpError("POST", "http://127.0.0.1:8080/v1/responses", 404, "missing"),
+        ):
+            with self.assertRaisesRegex(lab.LabError, "/v1/responses"):
+                lab.verify_responses_endpoint(
+                    {"server": {"host": "127.0.0.1", "port": 8080}},
+                    5,
+                )
+
+    def test_doctor_prints_resolved_skill_eval_tool_versions(self):
+        config = {
+            "_config_path": "test-config.json",
+            "paths": {},
+            "server": {"host": "127.0.0.1", "port": 8080},
+            "benchmarks": {},
+        }
+        completed = mock.Mock(stdout="0.122.0\n", stderr="", returncode=0)
+        output = io.StringIO()
+
+        with mock.patch.object(lab, "validate_catalog_config"), mock.patch.object(
+            lab, "which", return_value="/tool"
+        ), mock.patch.object(lab, "hf_binary", return_value="/tool"), mock.patch.object(
+            lab,
+            "skill_eval_dependencies",
+            return_value={
+                "promptfoo": "/repo/node_modules/.bin/promptfoo",
+                "codex_sdk": "0.147.0",
+            },
+        ), mock.patch.object(lab.subprocess, "run", return_value=completed), redirect_stdout(output):
+            lab.cmd_doctor(Namespace(), config)
+
+        self.assertIn("promptfoo: 0.122.0", output.getvalue())
+        self.assertIn("codex sdk: 0.147.0", output.getvalue())
+
     def test_deep_merge_preserves_unrelated_nested_values(self):
         merged = lab.deep_merge(
             {"server": {"host": "127.0.0.1", "port": 8080}, "models": {"a": {"status": "core"}}},

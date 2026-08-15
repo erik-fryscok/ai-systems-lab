@@ -457,6 +457,67 @@ def wait_for_models_endpoint(cfg, deadline_seconds):
     raise LabError(f"Server did not respond at {api_base(cfg)}/models within {deadline_seconds}s: {last_error}")
 
 
+def skill_eval_dependencies():
+    promptfoo = which(str(REPO_ROOT / "node_modules" / ".bin" / "promptfoo"))
+    sdk_version = None
+    lock_path = REPO_ROOT / "package-lock.json"
+    if lock_path.exists():
+        try:
+            package_lock = json.loads(lock_path.read_text(encoding="utf-8"))
+            sdk_versions = {
+                package.get("version")
+                for path, package in (package_lock.get("packages") or {}).items()
+                if path.endswith("node_modules/@openai/codex-sdk")
+            }
+            if sdk_versions == {"0.147.0"}:
+                sdk_version = "0.147.0"
+        except (OSError, json.JSONDecodeError):
+            pass
+    return {"promptfoo": promptfoo, "codex_sdk": sdk_version}
+
+
+def require_skill_eval_dependencies():
+    dependencies = skill_eval_dependencies()
+    if not dependencies["promptfoo"] or dependencies["codex_sdk"] != "0.147.0":
+        raise LabError(
+            "Skill evaluation dependencies are unavailable or out of date. "
+            "Run `npm ci` from the repository root."
+        )
+    return dependencies
+
+
+def binary_version(binary):
+    if not binary:
+        return None
+    try:
+        result = subprocess.run(
+            [binary, "--version"],
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode:
+        return None
+    value = (result.stdout or result.stderr).strip()
+    return value or None
+
+
+def verify_responses_endpoint(cfg, timeout):
+    url = f"{api_base(cfg)}/v1/responses"
+    try:
+        json_request("GET", url, timeout=timeout)
+    except LabHttpError as exc:
+        if exc.status == 404:
+            raise LabError(
+                f"Local server is incompatible with skill evaluation: {url} is unavailable. "
+                "Use a llama.cpp server that supports /v1/responses."
+            ) from exc
+        if exc.status != 405:
+            raise
+
+
 def command_to_string(command):
     return " ".join(shlex.quote(str(part)) for part in command)
 
@@ -478,6 +539,9 @@ def cmd_doctor(args, cfg):
         status = found or "missing"
         print(f"{label}: {status}")
     print(f"huggingface cli: {hf or 'missing'}")
+    skill_dependencies = skill_eval_dependencies()
+    print(f"promptfoo: {binary_version(skill_dependencies['promptfoo']) or 'missing'}")
+    print(f"codex sdk: {skill_dependencies['codex_sdk'] or 'missing'}")
     for label, path in paths(cfg).items():
         print(f"{label}: {path}")
     print(f"api_base: {api_base(cfg)}/v1")
