@@ -6,6 +6,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import yaml
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location(
@@ -334,6 +336,122 @@ class SkillWorkspaceTests(unittest.TestCase):
             rows = skill_eval.stage_cases(self.contract, self.package, 2, self.run_root)
 
         self.assertNotEqual(rows[0].canaries, rows[1].canaries)
+
+
+class PromptfooConfigTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.skill_dir = self.root / "skills" / "safe-skill"
+        self.skill_dir.mkdir(parents=True)
+        (self.skill_dir / "SKILL.md").write_text(
+            "# Safe skill\n\nReturn CERULEAN-FALCON-SKILL.\n", encoding="utf-8"
+        )
+        self.eval_dir = self.root / ".skill-evals" / "safe-skill"
+        fixture = self.eval_dir / "fixtures" / "empty-repo"
+        fixture.mkdir(parents=True)
+        (fixture / "README.md").write_text("empty fixture\n", encoding="utf-8")
+        (self.eval_dir / "cases.yaml").write_text(VALID_CASES, encoding="utf-8")
+        contract = skill_eval.load_skill_contract(self.skill_dir, self.eval_dir)
+        package = skill_eval.validate_skill_package(self.skill_dir)
+        self.rows = skill_eval.stage_cases(contract, package, 1, self.root / "run")
+        self.cfg = json.loads((REPO_ROOT / "config" / "lab.json").read_text(encoding="utf-8"))
+        self.local_target = skill_eval.parse_target("local:fast-9b", self.cfg)
+        self.output = self.root / "promptfooconfig.yaml"
+
+    def test_local_target_uses_custom_responses_provider(self):
+        config = skill_eval.build_promptfoo_config(
+            self.local_target, "gpt-5.6-terra", self.rows, "smoke", self.output
+        )
+        provider = config["providers"][0]
+
+        self.assertEqual(provider["id"], "openai:codex-sdk")
+        self.assertEqual(provider["config"]["model_provider"], "local_lab")
+        self.assertEqual(provider["config"]["model"], "fast-9b")
+        self.assertEqual(provider["config"]["cli_config"]["model_context_window"], 32768)
+        self.assertEqual(
+            provider["config"]["cli_config"]["model_providers"]["local_lab"]["wire_api"],
+            "responses",
+        )
+        self.assertEqual(
+            provider["config"]["cli_config"]["model_providers"]["local_lab"]["base_url"],
+            "http://127.0.0.1:8080/v1",
+        )
+        self.assertEqual(yaml.safe_load(self.output.read_text(encoding="utf-8")), config)
+
+    def test_cloud_target_uses_hardened_codex_sdk_provider_settings(self):
+        target = skill_eval.parse_target("openai:gpt-5.6-terra", self.cfg)
+        config = skill_eval.build_promptfoo_config(
+            target, "gpt-5.6", self.rows, "smoke", self.output
+        )
+        provider = config["providers"][0]
+
+        self.assertEqual(target.provider_id, "openai:codex-sdk")
+        self.assertIsNone(target.context_tokens)
+        self.assertEqual(provider["id"], "openai:codex-sdk")
+        self.assertEqual(
+            provider["config"],
+            {
+                "model": "gpt-5.6-terra",
+                "working_dir": "{{workspaceDir}}",
+                "sandbox_mode": "{{sandboxMode}}",
+                "approval_policy": "never",
+                "enable_streaming": True,
+                "deep_tracing": True,
+                "network_access_enabled": False,
+                "web_search_mode": "disabled",
+                "cli_env": {"CODEX_HOME": "{{codexHome}}"},
+            },
+        )
+
+    def test_generated_tests_copy_contract_assertions_and_use_explicit_judge(self):
+        config = skill_eval.build_promptfoo_config(
+            self.local_target, "gpt-5.6-terra", self.rows, "smoke", self.output
+        )
+        direct = config["tests"][0]
+        negative = next(test for test in config["tests"] if test["vars"]["caseId"] == "negative-unrelated")
+
+        self.assertEqual(config["prompts"], ["{{prompt}}"])
+        self.assertEqual(direct["vars"]["workspaceDir"], str(self.rows[0].workspace_dir))
+        self.assertEqual(direct["vars"]["codexHome"], str(self.rows[0].codex_home))
+        self.assertIn({"type": "contains", "value": "CERULEAN-FALCON-SKILL"}, direct["assert"])
+        self.assertIn({"type": "skill-used", "value": "safe-skill"}, direct["assert"])
+        self.assertIn(
+            {
+                "type": "llm-rubric",
+                "value": "The response follows the skill and returns only the requested token.",
+                "provider": "openai:responses:gpt-5.6-terra",
+            },
+            direct["assert"],
+        )
+        self.assertIn({"type": "not-skill-used", "value": "safe-skill"}, negative["assert"])
+
+    def test_openai_judge_cannot_equal_candidate(self):
+        target = skill_eval.parse_target("openai:gpt-5.6-terra", self.cfg)
+
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "judge must differ"):
+            skill_eval.validate_judge(target, "gpt-5.6-terra")
+
+    def test_target_parser_rejects_unknown_and_embedding_local_aliases(self):
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "unknown local model"):
+            skill_eval.parse_target("local:missing", self.cfg)
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "embedding"):
+            skill_eval.parse_target("local:embed-4b", self.cfg)
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "openai:MODEL_ID"):
+            skill_eval.parse_target("gpt-5.6-terra", self.cfg)
+
+    def test_config_rejects_unknown_profile_and_blank_judge(self):
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "profile"):
+            skill_eval.build_promptfoo_config(
+                self.local_target, "gpt-5.6-terra", self.rows, "deep", self.output
+            )
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "judge model"):
+            skill_eval.validate_judge(self.local_target, " ")
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "target"):
+            skill_eval.parse_target("openai: gpt-5.6-terra", self.cfg)
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "judge model"):
+            skill_eval.validate_judge(self.local_target, " gpt-5.6-terra")
 
 
 if __name__ == "__main__":

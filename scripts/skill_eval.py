@@ -79,6 +79,16 @@ class StagedCase:
     sandbox: str
     canaries: Mapping[str, str]
     baseline_hashes: Mapping[str, str]
+    case: SkillCase
+    skill_name: str
+
+
+@dataclass(frozen=True)
+class TargetSpec:
+    kind: str
+    model: str
+    provider_id: str
+    context_tokens: Optional[int]
 
 
 def load_skill_contract(skill_dir: Path, eval_dir: Optional[Path] = None) -> SkillContract:
@@ -212,9 +222,156 @@ def stage_cases(
                     sandbox=case.sandbox,
                     canaries=canaries,
                     baseline_hashes=baseline_hashes,
+                    case=case,
+                    skill_name=contract.skill_name,
                 )
             )
     return staged
+
+
+def parse_target(value: str, cfg: dict) -> TargetSpec:
+    """Parse an explicit cloud target or a configured non-embedding local alias."""
+    target = _require_text(value, "target")
+    if target.count(":") != 1:
+        raise SkillEvalError("target must be openai:MODEL_ID or local:LAB_ALIAS")
+    kind, model = target.split(":", 1)
+    if not model.strip() or model != model.strip():
+        raise SkillEvalError("target must be openai:MODEL_ID or local:LAB_ALIAS")
+    if kind == "openai":
+        return TargetSpec(kind="openai", model=model, provider_id="openai:codex-sdk", context_tokens=None)
+    if kind != "local":
+        raise SkillEvalError("target must be openai:MODEL_ID or local:LAB_ALIAS")
+
+    config = _require_mapping(cfg, "configuration")
+    models = _require_mapping(config.get("models"), "configuration.models")
+    model_config = models.get(model)
+    if not isinstance(model_config, dict):
+        raise SkillEvalError(f"unknown local model alias: {model}")
+    roles = model_config.get("roles")
+    if not isinstance(roles, list) or any(not isinstance(role, str) for role in roles):
+        raise SkillEvalError(f"local model alias has invalid roles: {model}")
+    if "embedding" in roles:
+        raise SkillEvalError("local target must not use an embedding model")
+    context_tokens = model_config.get("context_tokens")
+    if not isinstance(context_tokens, int) or isinstance(context_tokens, bool) or context_tokens < 1:
+        raise SkillEvalError(f"local model alias must define positive context_tokens: {model}")
+    return TargetSpec(
+        kind="local",
+        model=model,
+        provider_id="local_lab",
+        context_tokens=context_tokens,
+    )
+
+
+def validate_judge(target: TargetSpec, judge_model: str) -> None:
+    """Require an explicit OpenAI Responses judge that cannot self-grade a cloud target."""
+    if not isinstance(target, TargetSpec):
+        raise SkillEvalError("target must be a TargetSpec")
+    judge = _require_text(judge_model, "judge model")
+    if judge != judge.strip() or ":" in judge:
+        raise SkillEvalError("judge model must be an OpenAI model ID without a provider prefix")
+    if target.kind == "openai" and target.model == judge:
+        raise SkillEvalError("judge must differ from an OpenAI candidate")
+
+
+def build_promptfoo_config(
+    target: TargetSpec,
+    judge_model: str,
+    staged_cases: list[StagedCase],
+    profile: str,
+    output_path: Path,
+) -> dict:
+    """Compile a no-inference Promptfoo configuration for already staged cases."""
+    if not isinstance(target, TargetSpec):
+        raise SkillEvalError("target must be a TargetSpec")
+    validate_judge(target, judge_model)
+    if profile not in {"smoke", "release"}:
+        raise SkillEvalError("profile must be smoke or release")
+    if not isinstance(staged_cases, list) or not staged_cases:
+        raise SkillEvalError("staged cases must be a nonempty list")
+
+    provider_config: dict[str, Any] = {
+        "model": target.model,
+        "working_dir": "{{workspaceDir}}",
+        "sandbox_mode": "{{sandboxMode}}",
+        "approval_policy": "never",
+        "enable_streaming": True,
+        "deep_tracing": True,
+        "network_access_enabled": False,
+        "web_search_mode": "disabled",
+        "cli_env": {"CODEX_HOME": "{{codexHome}}"},
+    }
+    if target.kind == "local":
+        if target.provider_id != "local_lab" or target.context_tokens is None:
+            raise SkillEvalError("local target is missing Codex provider settings")
+        provider_config.update(
+            {
+                "model_provider": target.provider_id,
+                "cli_config": {
+                    "model_context_window": target.context_tokens,
+                    "model_providers": {
+                        target.provider_id: {
+                            "name": "local-ai-lab",
+                            "base_url": "http://127.0.0.1:8080/v1",
+                            "wire_api": "responses",
+                        }
+                    },
+                },
+            }
+        )
+    elif target.kind != "openai" or target.provider_id != "openai:codex-sdk":
+        raise SkillEvalError("unsupported target provider")
+
+    config = {
+        "description": f"Skill evaluation ({profile}) for {target.kind}:{target.model}",
+        "prompts": ["{{prompt}}"],
+        "providers": [{"id": "openai:codex-sdk", "config": provider_config}],
+        "tests": [_promptfoo_test(row, judge_model) for row in staged_cases],
+        "evaluateOptions": {"maxConcurrency": 1},
+        "writeLatestResults": False,
+    }
+    _write_promptfoo_config(output_path, config)
+    return config
+
+
+def _promptfoo_test(row: StagedCase, judge_model: str) -> dict[str, Any]:
+    if not isinstance(row, StagedCase):
+        raise SkillEvalError("staged cases must contain StagedCase entries")
+    if row.case.case_id != row.case_id or row.case.sandbox != row.sandbox:
+        raise SkillEvalError("staged case does not match its contract")
+    _require_text(row.skill_name, "staged case skill name")
+    deterministic = [dict(assertion) for assertion in row.case.expected.output]
+    activation = "skill-used" if row.case.expected.skill_used else "not-skill-used"
+    assertions = deterministic + [
+        {"type": activation, "value": row.skill_name},
+        {
+            "type": "llm-rubric",
+            "value": row.case.rubric,
+            "provider": f"openai:responses:{judge_model}",
+        },
+    ]
+    return {
+        "description": f"{row.case_id} repetition {row.repetition}",
+        "vars": {
+            "caseId": row.case_id,
+            "codexHome": str(row.codex_home),
+            "prompt": row.case.prompt,
+            "sandboxMode": row.sandbox,
+            "workspaceDir": str(row.workspace_dir),
+        },
+        "assert": assertions,
+    }
+
+
+def _write_promptfoo_config(output_path: Path, config: Mapping[str, Any]) -> None:
+    destination = Path(output_path)
+    if destination.exists() and destination.is_symlink():
+        raise SkillEvalError("Promptfoo output path must not be a symlink")
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(yaml.safe_dump(dict(config), sort_keys=False), encoding="utf-8")
+    except OSError as error:
+        raise SkillEvalError(f"could not write Promptfoo config: {error}") from error
 
 
 def _prepare_run_root(run_root: Path) -> Path:
