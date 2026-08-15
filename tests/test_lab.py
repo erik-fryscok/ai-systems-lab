@@ -517,6 +517,48 @@ class CatalogTests(unittest.TestCase):
 
 
 class ProviderCatalogTests(unittest.TestCase):
+    def test_render_presets_omits_remote_models(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = {
+                "providers": {
+                    "local": {"type": "llama_cpp"},
+                    "cloud": {
+                        "type": "openai_compatible",
+                        "base_url": "https://api.example.test/v1",
+                        "api_key_env": "EXAMPLE_AI_API_KEY",
+                    },
+                },
+                "paths": {
+                    "models_dir": str(root / "models"),
+                    "generated_dir": str(root / "generated"),
+                },
+                "models": {
+                    "local-coder": {
+                        "provider": "local",
+                        "status": "core",
+                        "files": ["local-coder.gguf"],
+                        "preset": {"ctx-size": 8192},
+                    },
+                    "cloud-coder": {
+                        "provider": "cloud",
+                        "status": "candidate",
+                    },
+                },
+            }
+
+            rendered = lab.render_presets(config).read_text(encoding="utf-8")
+
+        self.assertIn("[local-coder]", rendered)
+        self.assertNotIn("[cloud-coder]", rendered)
+
+    def test_render_presets_validates_provider_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = {"paths": {"generated_dir": str(Path(directory) / "generated")}}
+
+            with self.assertRaises(ProviderConfigError):
+                lab.render_presets(config)
+
     def test_cloud_catalog_entry_does_not_require_local_preset_or_weight_files(self):
         config = {
             "providers": {
@@ -568,6 +610,32 @@ class ProviderCatalogTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(lab.LabError, "load requires a local llama.cpp model"):
             lab.require_local_model(config, "cloud-coder", "load")
+
+    def test_benchmark_mode_rejects_cloud_model_before_service_calls(self):
+        config = {
+            "providers": {
+                "cloud": {
+                    "type": "openai_compatible",
+                    "base_url": "https://api.example.test/v1",
+                    "api_key_env": "EXAMPLE_AI_API_KEY",
+                }
+            },
+            "models": {"cloud-coder": {"provider": "cloud"}},
+        }
+        args = Namespace(mode="benchmark", model="cloud-coder", timeout=30)
+
+        with mock.patch.object(lab, "load_service_state") as load_state, mock.patch.object(
+            lab, "api_is_ready"
+        ) as api_ready, mock.patch.object(lab, "switch_to_model") as switch_model, mock.patch.object(
+            lab, "save_service_state"
+        ) as save_state:
+            with self.assertRaisesRegex(lab.LabError, "mode requires a local llama.cpp model"):
+                lab.cmd_mode(args, config)
+
+        load_state.assert_not_called()
+        api_ready.assert_not_called()
+        switch_model.assert_not_called()
+        save_state.assert_not_called()
 
 
 class QualityTests(unittest.TestCase):

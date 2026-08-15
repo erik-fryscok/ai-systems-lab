@@ -388,6 +388,7 @@ def bool_ini(value):
 
 
 def render_presets(cfg):
+    validate_provider_config(cfg)
     out = generated_preset_path(cfg)
     out.parent.mkdir(parents=True, exist_ok=True)
 
@@ -401,6 +402,8 @@ def render_presets(cfg):
         lines.append(f"{key} = {bool_ini(value)}")
 
     for model_id in sorted(cfg.get("models", {})):
+        if not model_target(cfg, model_id).is_local:
+            continue
         entry = model_entry(cfg, model_id)
         if entry.get("status") == "retired":
             continue
@@ -1846,8 +1849,8 @@ def cmd_auto_idle(args, cfg):
 
 
 def cmd_mode(args, cfg):
-    state = load_service_state()
     if args.mode == "cline":
+        state = load_service_state()
         state.update({"mode": "cline", "pinned_model": None, "manual_unloaded": False})
         save_service_state(state)
         print("mode: cline (JIT loading and idle unload enabled)")
@@ -1855,6 +1858,8 @@ def cmd_mode(args, cfg):
     if not args.model:
         raise LabError("benchmark mode requires a model alias to pin")
     model_id = resolve_selector(cfg, args.model)
+    require_local_model(cfg, model_id, "mode")
+    state = load_service_state()
     if not api_is_ready(cfg):
         raise LabError("Local AI server is offline. Run 'make start' first.")
     switch_to_model(cfg, model_id, timeout=args.timeout)
