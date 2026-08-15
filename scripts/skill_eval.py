@@ -1,10 +1,12 @@
-"""Skill evaluation contract and package validation for local-ai-lab."""
+"""Skill evaluation contract and package validation for AI Systems Lab."""
 
 import hashlib
 import json
+import re
 import secrets
 import shutil
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,7 +16,15 @@ from typing import Any, Mapping, Optional, Tuple
 import yaml
 
 
-SCHEMA_PATH = Path(__file__).resolve().parents[1] / "benchmarks" / "skills" / "cases.schema.json"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from ai_systems_lab import PROJECT_NAME
+from ai_systems_lab.providers import ProviderConfigError, resolve_model_target
+
+
+SCHEMA_PATH = REPO_ROOT / "benchmarks" / "skills" / "cases.schema.json"
 APPROVED_CATEGORIES = (
     "direct_activation",
     "implicit_activation",
@@ -86,10 +96,20 @@ class StagedCase:
 
 @dataclass(frozen=True)
 class TargetSpec:
-    kind: str
+    selector: str
+    alias: Optional[str]
+    provider_name: str
+    provider_type: str
     model: str
-    provider_id: str
+    base_url: Optional[str]
+    api_key_env: Optional[str]
     context_tokens: Optional[int]
+    responses_api: bool
+
+    @property
+    def kind(self) -> str:
+        """Expose the legacy runtime classification while callers migrate to providers."""
+        return "local" if self.provider_type == "llama_cpp" else "openai"
 
 
 def load_skill_contract(skill_dir: Path, eval_dir: Optional[Path] = None) -> SkillContract:
@@ -144,7 +164,7 @@ def validate_skill_package(skill_dir: Path) -> SkillPackage:
             raise SkillEvalError(f"skill package contains a symlink: {relative_name}")
         if ".git" in relative_path.parts:
             raise SkillEvalError(f"skill package contains git metadata: {relative_name}")
-        if entry.name in {".skill-evals", ".local-ai-lab"}:
+        if entry.name in {".skill-evals", ".ai-systems-lab", ".local-ai-lab"}:
             raise SkillEvalError("skill package must not contain private evaluation data")
         if entry.is_dir():
             continue
@@ -243,36 +263,76 @@ def stage_cases(
 
 
 def parse_target(value: str, cfg: dict) -> TargetSpec:
-    """Parse an explicit cloud target or a configured non-embedding local alias."""
+    """Parse a catalog alias or a legacy explicit provider target."""
     target = _require_text(value, "target")
     if target.count(":") != 1:
-        raise SkillEvalError("target must be openai:MODEL_ID or local:LAB_ALIAS")
+        raise SkillEvalError(
+            "target must be catalog:LAB_ALIAS, local:LAB_ALIAS, or openai:MODEL_ID"
+        )
     kind, model = target.split(":", 1)
     if not model.strip() or model != model.strip():
-        raise SkillEvalError("target must be openai:MODEL_ID or local:LAB_ALIAS")
+        raise SkillEvalError(
+            "target must be catalog:LAB_ALIAS, local:LAB_ALIAS, or openai:MODEL_ID"
+        )
     if kind == "openai":
-        return TargetSpec(kind="openai", model=model, provider_id="openai:codex-sdk", context_tokens=None)
-    if kind != "local":
-        raise SkillEvalError("target must be openai:MODEL_ID or local:LAB_ALIAS")
+        return TargetSpec(
+            selector=target,
+            alias=None,
+            provider_name="openai-codex-sdk",
+            provider_type="openai",
+            model=model,
+            base_url=None,
+            api_key_env=None,
+            context_tokens=None,
+            responses_api=True,
+        )
+    if kind not in {"catalog", "local"}:
+        raise SkillEvalError(
+            "target must be catalog:LAB_ALIAS, local:LAB_ALIAS, or openai:MODEL_ID"
+        )
 
+    resolved = _catalog_target(model, cfg, target)
+    if kind == "local" and resolved.provider_type != "llama_cpp":
+        raise SkillEvalError("local target must resolve to a llama_cpp provider")
+    return resolved
+
+
+def _local_api_base(cfg: dict) -> str:
+    server = _require_mapping(cfg.get("server"), "configuration.server")
+    return f"http://{server.get('host', '127.0.0.1')}:{server.get('port', 8080)}/v1"
+
+
+def _catalog_target(alias: str, cfg: dict, selector: str) -> TargetSpec:
     config = _require_mapping(cfg, "configuration")
+    try:
+        target = resolve_model_target(config, alias, _local_api_base(config))
+    except ProviderConfigError as error:
+        raise SkillEvalError(str(error)) from error
+
     models = _require_mapping(config.get("models"), "configuration.models")
-    model_config = models.get(model)
-    if not isinstance(model_config, dict):
-        raise SkillEvalError(f"unknown local model alias: {model}")
+    model_config = _require_mapping(models.get(alias), f"configuration.models.{alias}")
     roles = model_config.get("roles")
     if not isinstance(roles, list) or any(not isinstance(role, str) for role in roles):
-        raise SkillEvalError(f"local model alias has invalid roles: {model}")
+        raise SkillEvalError(f"model alias has invalid roles: {alias}")
     if "embedding" in roles:
-        raise SkillEvalError("local target must not use an embedding model")
+        raise SkillEvalError("skill evaluation target must not use an embedding model")
     context_tokens = model_config.get("context_tokens")
     if not isinstance(context_tokens, int) or isinstance(context_tokens, bool) or context_tokens < 1:
-        raise SkillEvalError(f"local model alias must define positive context_tokens: {model}")
+        raise SkillEvalError(f"model alias must define positive context_tokens: {alias}")
+    if not target.responses_api:
+        raise SkillEvalError(
+            f"provider '{target.provider}' must declare Responses API capability"
+        )
     return TargetSpec(
-        kind="local",
-        model=model,
-        provider_id="local_lab",
+        selector=selector,
+        alias=alias,
+        provider_name=target.provider,
+        provider_type=target.provider_type,
+        model=target.model_id,
+        base_url=target.base_url,
+        api_key_env=target.api_key_env,
         context_tokens=context_tokens,
+        responses_api=target.responses_api,
     )
 
 
@@ -283,8 +343,8 @@ def validate_judge(target: TargetSpec, judge_model: str) -> None:
     judge = _require_text(judge_model, "judge model")
     if judge != judge.strip() or ":" in judge:
         raise SkillEvalError("judge model must be an OpenAI model ID without a provider prefix")
-    if target.kind == "openai" and target.model == judge:
-        raise SkillEvalError("judge must differ from an OpenAI candidate")
+    if target.model == judge:
+        raise SkillEvalError("judge must differ from the candidate")
 
 
 def build_promptfoo_config(
@@ -314,29 +374,37 @@ def build_promptfoo_config(
         "web_search_mode": "disabled",
         "cli_env": {"CODEX_HOME": "{{codexHome}}"},
     }
-    if target.kind == "local":
-        if target.provider_id != "local_lab" or target.context_tokens is None:
-            raise SkillEvalError("local target is missing Codex provider settings")
+    if target.alias is not None:
+        if target.context_tokens is None or target.base_url is None:
+            raise SkillEvalError("catalog target is missing Codex provider settings")
+        provider_id = "ai_systems_lab_" + re.sub(
+            r"[^a-z0-9_]+", "_", target.provider_name.lower()
+        )
+        provider_definition = {
+            "name": PROJECT_NAME,
+            "base_url": target.base_url,
+            "wire_api": "responses",
+        }
+        if target.api_key_env:
+            provider_definition["env_key"] = target.api_key_env
         provider_config.update(
             {
-                "model_provider": target.provider_id,
+                "model_provider": provider_id,
                 "cli_config": {
                     "model_context_window": target.context_tokens,
-                    "model_providers": {
-                        target.provider_id: {
-                            "name": "local-ai-lab",
-                            "base_url": "http://127.0.0.1:8080/v1",
-                            "wire_api": "responses",
-                        }
-                    },
+                    "model_providers": {provider_id: provider_definition},
                 },
             }
         )
-    elif target.kind != "openai" or target.provider_id != "openai:codex-sdk":
+    elif (
+        target.provider_name != "openai-codex-sdk"
+        or target.provider_type != "openai"
+        or not target.responses_api
+    ):
         raise SkillEvalError("unsupported target provider")
 
     config = {
-        "description": f"Skill evaluation ({profile}) for {target.kind}:{target.model}",
+        "description": f"Skill evaluation ({profile}) for {target.selector}",
         "prompts": ["{{prompt}}"],
         "providers": [{"id": "openai:codex-sdk", "config": provider_config}],
         "tests": [_promptfoo_test(row, judge_model) for row in staged_cases],

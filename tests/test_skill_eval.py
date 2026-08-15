@@ -229,10 +229,17 @@ class SkillPackageTests(unittest.TestCase):
         with self.assertRaisesRegex(skill_eval.SkillEvalError, "symlink"):
             skill_eval.validate_skill_package(self.skill_dir)
 
-    def test_package_rejects_private_evidence(self):
-        private_evidence = self.skill_dir / ".local-ai-lab"
+    def test_package_rejects_ai_systems_lab_private_evidence(self):
+        private_evidence = self.skill_dir / ".ai-systems-lab"
         private_evidence.mkdir()
         (private_evidence / "run.json").write_text("{}\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "private evaluation data"):
+            skill_eval.validate_skill_package(self.skill_dir)
+
+    def test_package_rejects_legacy_local_ai_lab_private_evidence(self):
+        private_evidence = self.skill_dir / ".local-ai-lab"
+        private_evidence.mkdir()
 
         with self.assertRaisesRegex(skill_eval.SkillEvalError, "private evaluation data"):
             skill_eval.validate_skill_package(self.skill_dir)
@@ -259,7 +266,7 @@ class SkillWorkspaceTests(unittest.TestCase):
         (self.eval_dir / "cases.yaml").write_text(VALID_CASES, encoding="utf-8")
         self.contract = skill_eval.load_skill_contract(self.skill_dir, self.eval_dir)
         self.package = skill_eval.validate_skill_package(self.skill_dir)
-        self.run_root = self.root / ".local-ai-lab" / "skill-evals" / "test-run"
+        self.run_root = self.root / ".ai-systems-lab" / "skill-evals" / "test-run"
 
     def test_each_repetition_has_an_independent_git_workspace(self):
         rows = skill_eval.stage_cases(self.contract, self.package, 2, self.run_root)
@@ -357,8 +364,60 @@ class PromptfooConfigTests(unittest.TestCase):
         package = skill_eval.validate_skill_package(self.skill_dir)
         self.rows = skill_eval.stage_cases(contract, package, 1, self.root / "run")
         self.cfg = json.loads((REPO_ROOT / "config" / "lab.json").read_text(encoding="utf-8"))
-        self.local_target = skill_eval.parse_target("local:fast-9b", self.cfg)
+        self.local_target = skill_eval.parse_target("catalog:fast-9b", self.cfg)
         self.output = self.root / "promptfooconfig.yaml"
+
+    def test_catalog_target_resolves_local_provider(self):
+        target = skill_eval.parse_target("catalog:fast-9b", self.cfg)
+        self.assertEqual(target.alias, "fast-9b")
+        self.assertEqual(target.provider_name, "local-llama")
+        self.assertEqual(target.provider_type, "llama_cpp")
+        self.assertEqual(target.model, "fast-9b")
+        self.assertEqual(target.context_tokens, 32768)
+        self.assertTrue(target.responses_api)
+
+    def test_catalog_target_resolves_cloud_provider(self):
+        config = json.loads(json.dumps(self.cfg))
+        config["providers"]["cloud"] = {
+            "type": "openai_compatible",
+            "base_url": "https://api.example.test/v1",
+            "api_key_env": "EXAMPLE_AI_API_KEY",
+            "responses_api": True,
+        }
+        config["models"]["cloud-coder"] = {
+            "provider": "cloud",
+            "provider_model": "vendor/coder-v1",
+            "roles": ["coding"],
+            "context_tokens": 65536,
+        }
+        target = skill_eval.parse_target("catalog:cloud-coder", config)
+        self.assertEqual(target.provider_name, "cloud")
+        self.assertEqual(target.provider_type, "openai_compatible")
+        self.assertEqual(target.model, "vendor/coder-v1")
+        self.assertEqual(target.api_key_env, "EXAMPLE_AI_API_KEY")
+        self.assertEqual(target.base_url, "https://api.example.test/v1")
+
+    def test_catalog_target_rejects_provider_without_responses_capability(self):
+        config = json.loads(json.dumps(self.cfg))
+        config["providers"]["chat-only"] = {
+            "type": "openai_compatible",
+            "base_url": "https://api.example.test/v1",
+            "api_key_env": "EXAMPLE_AI_API_KEY",
+        }
+        config["models"]["chat-only"] = {
+            "provider": "chat-only",
+            "roles": ["coding"],
+            "context_tokens": 32768,
+        }
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "Responses API"):
+            skill_eval.parse_target("catalog:chat-only", config)
+
+    def test_legacy_local_target_maps_to_catalog_target(self):
+        legacy = skill_eval.parse_target("local:fast-9b", self.cfg)
+        current = skill_eval.parse_target("catalog:fast-9b", self.cfg)
+        self.assertEqual(legacy.alias, current.alias)
+        self.assertEqual(legacy.provider_name, current.provider_name)
+        self.assertEqual(legacy.model, current.model)
 
     def test_local_target_uses_custom_responses_provider(self):
         config = skill_eval.build_promptfoo_config(
@@ -366,19 +425,63 @@ class PromptfooConfigTests(unittest.TestCase):
         )
         provider = config["providers"][0]
 
+        self.assertEqual(
+            config["description"], "Skill evaluation (smoke) for catalog:fast-9b"
+        )
         self.assertEqual(provider["id"], "openai:codex-sdk")
-        self.assertEqual(provider["config"]["model_provider"], "local_lab")
+        self.assertEqual(
+            provider["config"]["model_provider"], "ai_systems_lab_local_llama"
+        )
         self.assertEqual(provider["config"]["model"], "fast-9b")
         self.assertEqual(provider["config"]["cli_config"]["model_context_window"], 32768)
         self.assertEqual(
-            provider["config"]["cli_config"]["model_providers"]["local_lab"]["wire_api"],
+            provider["config"]["cli_config"]["model_providers"][
+                "ai_systems_lab_local_llama"
+            ]["wire_api"],
             "responses",
         )
         self.assertEqual(
-            provider["config"]["cli_config"]["model_providers"]["local_lab"]["base_url"],
+            provider["config"]["cli_config"]["model_providers"][
+                "ai_systems_lab_local_llama"
+            ]["base_url"],
             "http://127.0.0.1:8080/v1",
         )
         self.assertEqual(yaml.safe_load(self.output.read_text(encoding="utf-8")), config)
+
+    def test_catalog_cloud_target_uses_custom_responses_provider(self):
+        config_data = json.loads(json.dumps(self.cfg))
+        config_data["providers"]["Cloud Vendor-1"] = {
+            "type": "openai_compatible",
+            "base_url": "https://api.example.test/v1",
+            "api_key_env": "EXAMPLE_AI_API_KEY",
+            "responses_api": True,
+        }
+        config_data["models"]["cloud-coder"] = {
+            "provider": "Cloud Vendor-1",
+            "provider_model": "vendor/coder-v1",
+            "roles": ["coding"],
+            "context_tokens": 65536,
+        }
+        target = skill_eval.parse_target("catalog:cloud-coder", config_data)
+
+        config = skill_eval.build_promptfoo_config(
+            target, "gpt-5.6-terra", self.rows, "smoke", self.output
+        )
+        provider_config = config["providers"][0]["config"]
+        provider_id = "ai_systems_lab_cloud_vendor_1"
+
+        self.assertEqual(provider_config["model_provider"], provider_id)
+        self.assertEqual(provider_config["model"], "vendor/coder-v1")
+        self.assertEqual(provider_config["cli_config"]["model_context_window"], 65536)
+        self.assertEqual(
+            provider_config["cli_config"]["model_providers"][provider_id],
+            {
+                "name": "AI Systems Lab",
+                "base_url": "https://api.example.test/v1",
+                "wire_api": "responses",
+                "env_key": "EXAMPLE_AI_API_KEY",
+            },
+        )
 
     def test_cloud_target_uses_hardened_codex_sdk_provider_settings(self):
         target = skill_eval.parse_target("openai:gpt-5.6-terra", self.cfg)
@@ -387,8 +490,12 @@ class PromptfooConfigTests(unittest.TestCase):
         )
         provider = config["providers"][0]
 
-        self.assertEqual(target.provider_id, "openai:codex-sdk")
+        self.assertEqual(target.provider_name, "openai-codex-sdk")
         self.assertIsNone(target.context_tokens)
+        self.assertEqual(
+            config["description"],
+            "Skill evaluation (smoke) for openai:gpt-5.6-terra",
+        )
         self.assertEqual(provider["id"], "openai:codex-sdk")
         self.assertEqual(
             provider["config"],
@@ -427,14 +534,16 @@ class PromptfooConfigTests(unittest.TestCase):
         )
         self.assertIn({"type": "not-skill-used", "value": "safe-skill"}, negative["assert"])
 
-    def test_openai_judge_cannot_equal_candidate(self):
+    def test_judge_cannot_equal_candidate_across_provider_spellings(self):
         target = skill_eval.parse_target("openai:gpt-5.6-terra", self.cfg)
 
         with self.assertRaisesRegex(skill_eval.SkillEvalError, "judge must differ"):
             skill_eval.validate_judge(target, "gpt-5.6-terra")
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "judge must differ"):
+            skill_eval.validate_judge(self.local_target, "fast-9b")
 
     def test_target_parser_rejects_unknown_and_embedding_local_aliases(self):
-        with self.assertRaisesRegex(skill_eval.SkillEvalError, "unknown local model"):
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "unknown model alias"):
             skill_eval.parse_target("local:missing", self.cfg)
         with self.assertRaisesRegex(skill_eval.SkillEvalError, "embedding"):
             skill_eval.parse_target("local:embed-4b", self.cfg)

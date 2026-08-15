@@ -2193,7 +2193,7 @@ def _cmd_skill_run(args, cfg, redteam):
         skill_eval.validate_judge(target, args.judge_model)
         dependencies = require_skill_eval_dependencies()
         if target.kind == "local":
-            model_files = model_weight_paths(cfg, target.model)
+            model_files = model_weight_paths(cfg, target.alias)
             missing = [path for path in model_files if not path.exists()]
             if missing:
                 raise LabError(
@@ -2254,7 +2254,7 @@ def _cmd_skill_run(args, cfg, redteam):
                 )
 
             session = (
-                benchmark_model_session(cfg, target.model, args.timeout)
+                benchmark_model_session(cfg, target.alias, args.timeout)
                 if target.kind == "local"
                 else nullcontext()
             )

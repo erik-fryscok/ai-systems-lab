@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://local-ai-lab.dev/schemas/skill-eval-cases-v1.json",
-  "title": "Local AI Lab Skill Evaluation Cases v1",
+  "$id": "https://ai-systems-lab.dev/schemas/skill-eval-cases-v1.json",
+  "title": "AI Systems Lab Skill Evaluation Cases v1",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "skill", "cases"],

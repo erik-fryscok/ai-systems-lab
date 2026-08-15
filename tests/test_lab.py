@@ -306,7 +306,9 @@ class SkillEvalCommandTests(unittest.TestCase):
         self.skill_dir = REPO_ROOT / "tests" / "fixtures" / "skill-project" / "skills" / "safe-skill"
         self.eval_dir = REPO_ROOT / "tests" / "fixtures" / "skill-project" / ".skill-evals" / "safe-skill"
         self.config = {
-            "providers": {"local": {"type": "llama_cpp"}},
+            "providers": {
+                "local": {"type": "llama_cpp", "responses_api": True}
+            },
             "paths": {
                 "models_dir": str(self.root / "models"),
                 "state_dir": str(self.root / "state"),
@@ -387,10 +389,16 @@ class SkillEvalCommandTests(unittest.TestCase):
             timeout=30,
             keep_workspaces=False,
         )
-        config = {"models": {}}
+        config = {
+            "providers": {
+                "local": {"type": "llama_cpp", "responses_api": True}
+            },
+            "server": {"host": "127.0.0.1", "port": 8080},
+            "models": {},
+        }
 
         with mock.patch.object(lab, "require_skill_eval_dependencies") as dependencies:
-            with self.assertRaisesRegex(lab.LabError, "unknown local model"):
+            with self.assertRaisesRegex(lab.LabError, "unknown model alias"):
                 lab.cmd_skill_eval(args, config)
 
         dependencies.assert_not_called()
@@ -430,6 +438,24 @@ class SkillEvalCommandTests(unittest.TestCase):
 
         stage_cases.assert_not_called()
         benchmark_session.assert_not_called()
+
+    def test_local_catalog_target_uses_alias_for_assets_and_residency(self):
+        self.install_local_model()
+        self.config["models"]["fast-9b"]["provider_model"] = "served-fast"
+        with mock.patch.object(
+            lab, "require_skill_eval_dependencies", return_value={"promptfoo": "/promptfoo"}
+        ), mock.patch.object(
+            lab, "verify_responses_endpoint"
+        ), mock.patch.object(
+            lab, "benchmark_model_session"
+        ) as benchmark_session, mock.patch.object(
+            lab.skill_eval, "run_promptfoo"
+        ), redirect_stdout(io.StringIO()):
+            lab.cmd_skill_eval(
+                self.command_args(target="catalog:fast-9b"), self.config
+            )
+
+        benchmark_session.assert_called_once_with(self.config, "fast-9b", 30)
 
     def test_promptfoo_failure_restores_and_removes_staged_workspaces_by_default(self):
         self.install_local_model()
