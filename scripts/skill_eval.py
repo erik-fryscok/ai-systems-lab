@@ -2,6 +2,9 @@
 
 import hashlib
 import json
+import secrets
+import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -67,6 +70,17 @@ class SkillPackage:
     digest: str
 
 
+@dataclass(frozen=True)
+class StagedCase:
+    case_id: str
+    repetition: int
+    workspace_dir: Path
+    codex_home: Path
+    sandbox: str
+    canaries: Mapping[str, str]
+    baseline_hashes: Mapping[str, str]
+
+
 def load_skill_contract(skill_dir: Path, eval_dir: Optional[Path] = None) -> SkillContract:
     """Load and validate the version-1 cases contract before any inference."""
     resolved_skill_dir = _require_directory(skill_dir, "skill directory")
@@ -129,6 +143,244 @@ def validate_skill_package(skill_dir: Path) -> SkillPackage:
         runtime_files=tuple(runtime_files),
         digest=_package_digest(resolved_skill_dir, runtime_files),
     )
+
+
+def stage_cases(
+    contract: SkillContract,
+    package: SkillPackage,
+    repetitions: int,
+    run_root: Path,
+) -> list[StagedCase]:
+    """Stage one isolated, pristine workspace for every case and repetition."""
+    if not isinstance(repetitions, int) or isinstance(repetitions, bool) or repetitions < 1:
+        raise SkillEvalError("repetitions must be a positive integer")
+
+    eval_dir = _require_directory(contract.eval_dir, "eval directory")
+    validated_package = validate_skill_package(package.skill_dir)
+    if package.digest != validated_package.digest or package.runtime_files != validated_package.runtime_files:
+        raise SkillEvalError("skill package changed after validation")
+
+    resolved_run_root = _prepare_run_root(run_root)
+    _reject_nested_paths(resolved_run_root, eval_dir, "run root", "eval directory")
+    _reject_nested_paths(resolved_run_root, validated_package.skill_dir, "run root", "skill package")
+    workspace_root = _create_child_directory(resolved_run_root, "workspaces")
+    codex_root = _create_child_directory(resolved_run_root, "codex-homes")
+    verifier_root = _create_child_directory(resolved_run_root, "verifiers")
+
+    staged = []
+    for case in contract.cases:
+        fixture = _validated_fixture_for_staging(case.fixture, eval_dir)
+        _require_safe_case_id(case.case_id)
+        for repetition in range(1, repetitions + 1):
+            row_name = f"{case.case_id}-{repetition}"
+            workspace_dir = _new_child_directory(workspace_root, row_name, "workspace")
+            codex_home = _new_child_directory(codex_root, row_name, "CODEX_HOME")
+            _copy_fixture(fixture, workspace_dir)
+            baseline_hashes = MappingProxyType(_hash_regular_files(workspace_dir))
+            _initialize_pristine_git_repository(workspace_dir)
+            _install_runtime_skill(validated_package, workspace_dir, contract.skill_name)
+
+            canaries = MappingProxyType(_new_canaries())
+            verifier_path = _new_child_file(verifier_root, f"{row_name}.json", "verifier configuration")
+            verifier_path.write_text(
+                json.dumps(
+                    {
+                        "baseline_hashes": dict(baseline_hashes),
+                        "canaries": dict(canaries),
+                        "case_id": case.case_id,
+                        "package_digest": validated_package.digest,
+                        "repetition": repetition,
+                        "sandbox": case.sandbox,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            staged.append(
+                StagedCase(
+                    case_id=case.case_id,
+                    repetition=repetition,
+                    workspace_dir=workspace_dir,
+                    codex_home=codex_home,
+                    sandbox=case.sandbox,
+                    canaries=canaries,
+                    baseline_hashes=baseline_hashes,
+                )
+            )
+    return staged
+
+
+def _prepare_run_root(run_root: Path) -> Path:
+    candidate = Path(run_root)
+    if candidate.is_symlink():
+        raise SkillEvalError("run root must not be a symlink")
+    try:
+        candidate.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise SkillEvalError(f"could not create run root: {error}") from error
+    if candidate.is_symlink() or not candidate.is_dir():
+        raise SkillEvalError("run root must be a directory")
+    return candidate.resolve()
+
+
+def _reject_nested_paths(first: Path, second: Path, first_label: str, second_label: str) -> None:
+    try:
+        first.relative_to(second)
+    except ValueError:
+        try:
+            second.relative_to(first)
+        except ValueError:
+            return
+    raise SkillEvalError(f"{first_label} must not overlap {second_label}")
+
+
+def _create_child_directory(parent: Path, name: str) -> Path:
+    candidate = parent / name
+    _require_child_path(candidate, parent, "directory")
+    if candidate.exists():
+        if candidate.is_symlink() or not candidate.is_dir():
+            raise SkillEvalError(f"staging directory is not a regular directory: {candidate}")
+    else:
+        candidate.mkdir()
+    return _require_child_path(candidate, parent, "directory")
+
+
+def _new_child_directory(parent: Path, name: str, label: str) -> Path:
+    candidate = parent / name
+    _require_child_path(candidate, parent, label)
+    if candidate.exists() or candidate.is_symlink():
+        raise SkillEvalError(f"{label} already exists: {candidate}")
+    candidate.mkdir()
+    return _require_child_path(candidate, parent, label)
+
+
+def _new_child_file(parent: Path, name: str, label: str) -> Path:
+    candidate = parent / name
+    _require_child_path(candidate, parent, label)
+    if candidate.exists() or candidate.is_symlink():
+        raise SkillEvalError(f"{label} already exists: {candidate}")
+    return candidate
+
+
+def _require_child_path(path: Path, parent: Path, label: str) -> Path:
+    try:
+        resolved = path.resolve()
+        resolved.relative_to(parent)
+    except ValueError as error:
+        raise SkillEvalError(f"{label} escapes its staging root") from error
+    if path.is_symlink():
+        raise SkillEvalError(f"{label} must not be a symlink")
+    return resolved
+
+
+def _require_safe_case_id(case_id: str) -> None:
+    if (
+        not isinstance(case_id, str)
+        or not case_id
+        or case_id in {".", ".."}
+        or "/" in case_id
+        or "\\" in case_id
+        or ".." in case_id
+    ):
+        raise SkillEvalError("case ID escapes the workspace root")
+
+
+def _validated_fixture_for_staging(fixture: Path, eval_dir: Path) -> Path:
+    fixture_path = Path(fixture)
+    if fixture_path.is_symlink() or not fixture_path.is_dir():
+        raise SkillEvalError("fixture must be a regular directory")
+    resolved = fixture_path.resolve()
+    try:
+        resolved.relative_to(eval_dir)
+    except ValueError as error:
+        raise SkillEvalError("fixture path is outside eval directory") from error
+    _reject_symlink_components(fixture_path, eval_dir)
+    _validate_regular_tree(fixture_path, "fixture")
+    return resolved
+
+
+def _copy_fixture(source: Path, destination: Path) -> None:
+    for entry in sorted(source.rglob("*"), key=lambda item: item.relative_to(source).as_posix()):
+        relative = entry.relative_to(source)
+        if relative.parts[0] == ".git":
+            continue
+        target = destination / relative
+        _require_child_path(target, destination, "fixture entry")
+        if entry.is_symlink():
+            raise SkillEvalError(f"fixture contains a symlink: {relative}")
+        if entry.is_dir():
+            target.mkdir(exist_ok=False)
+        elif entry.is_file():
+            shutil.copy2(entry, target, follow_symlinks=False)
+            if target.is_symlink() or not target.is_file():
+                raise SkillEvalError(f"fixture copy is not a regular file: {relative}")
+        else:
+            raise SkillEvalError(f"fixture contains a non-regular entry: {relative}")
+
+
+def _hash_regular_files(root: Path) -> dict[str, str]:
+    hashes = {}
+    for entry in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+        relative = entry.relative_to(root).as_posix()
+        if entry.is_symlink() or not entry.is_file():
+            if entry.is_dir():
+                continue
+            raise SkillEvalError(f"workspace contains a non-regular entry: {relative}")
+        hashes[relative] = hashlib.sha256(entry.read_bytes()).hexdigest()
+    return hashes
+
+
+def _initialize_pristine_git_repository(workspace_dir: Path) -> None:
+    commands = (
+        ("git", "init", "--quiet"),
+        ("git", "add", "--all"),
+        (
+            "git",
+            "-c",
+            "user.name=skill-eval",
+            "-c",
+            "user.email=skill-eval@local.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "Pristine fixture",
+        ),
+    )
+    for command in commands:
+        try:
+            subprocess.run(command, cwd=workspace_dir, check=True, capture_output=True, text=True)
+        except (OSError, subprocess.CalledProcessError) as error:
+            raise SkillEvalError(f"could not initialize pristine git workspace: {error}") from error
+
+
+def _install_runtime_skill(package: SkillPackage, workspace_dir: Path, skill_name: str) -> None:
+    destination_root = workspace_dir / ".agents" / "skills" / skill_name
+    _require_child_path(destination_root, workspace_dir, "runtime skill directory")
+    destination_root.mkdir(parents=True, exist_ok=False)
+    for source in package.runtime_files:
+        relative = source.relative_to(package.skill_dir)
+        destination = destination_root / relative
+        _require_child_path(destination, destination_root, "runtime skill file")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_symlink() or not source.is_file():
+            raise SkillEvalError(f"runtime skill file is no longer regular: {relative}")
+        shutil.copy2(source, destination, follow_symlinks=False)
+        if destination.is_symlink() or not destination.is_file():
+            raise SkillEvalError(f"runtime skill copy is not a regular file: {relative}")
+
+
+def _new_canaries() -> dict[str, str]:
+    return {
+        "environment": f"skill-eval-env-{secrets.token_urlsafe(24)}",
+        "file": f"skill-eval-file-{secrets.token_urlsafe(24)}",
+        "terminal": f"skill-eval-terminal-{secrets.token_urlsafe(24)}",
+        "network": f"https://{secrets.token_urlsafe(24)}.invalid",
+    }
 
 
 def _resolve_eval_dir(skill_dir: Path, eval_dir: Optional[Path]) -> Path:

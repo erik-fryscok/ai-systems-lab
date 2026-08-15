@@ -235,5 +235,48 @@ class SkillPackageTests(unittest.TestCase):
             skill_eval.validate_skill_package(self.skill_dir)
 
 
+class SkillWorkspaceTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.skill_dir = self.root / "skills" / "safe-skill"
+        self.skill_dir.mkdir(parents=True)
+        (self.skill_dir / "SKILL.md").write_text(
+            "# Safe skill\n\nReturn CERULEAN-FALCON-SKILL.\n", encoding="utf-8"
+        )
+        (self.skill_dir / "references").mkdir()
+        (self.skill_dir / "references" / "token.txt").write_text(
+            "CERULEAN-FALCON-SKILL\n", encoding="utf-8"
+        )
+        self.eval_dir = self.root / ".skill-evals" / "safe-skill"
+        fixture = self.eval_dir / "fixtures" / "empty-repo"
+        fixture.mkdir(parents=True)
+        (fixture / "README.md").write_text("empty fixture\n", encoding="utf-8")
+        (self.eval_dir / "cases.yaml").write_text(VALID_CASES, encoding="utf-8")
+        self.contract = skill_eval.load_skill_contract(self.skill_dir, self.eval_dir)
+        self.package = skill_eval.validate_skill_package(self.skill_dir)
+        self.run_root = self.root / ".local-ai-lab" / "skill-evals" / "test-run"
+
+    def test_each_repetition_has_an_independent_git_workspace(self):
+        rows = skill_eval.stage_cases(self.contract, self.package, 2, self.run_root)
+
+        self.assertEqual(len(rows), 12)
+        self.assertNotEqual(rows[0].workspace_dir, rows[1].workspace_dir)
+        self.assertTrue((rows[0].workspace_dir / ".git").is_dir())
+        self.assertTrue(
+            (rows[0].workspace_dir / ".agents" / "skills" / "safe-skill" / "SKILL.md").is_file()
+        )
+        self.assertFalse(
+            (rows[0].workspace_dir / ".agents" / "skills" / "safe-skill" / ".skill-evals").exists()
+        )
+        self.assertNotEqual(rows[0].codex_home, rows[1].codex_home)
+        self.assertTrue(rows[0].codex_home.is_dir())
+        self.assertTrue((self.run_root / "verifiers" / "direct-token-1.json").is_file())
+        self.assertFalse(str(self.run_root / "verifiers").startswith(str(rows[0].workspace_dir)))
+        self.assertEqual(set(rows[0].canaries), {"environment", "file", "terminal", "network"})
+        self.assertTrue(rows[0].baseline_hashes["README.md"])
+
+
 if __name__ == "__main__":
     unittest.main()
