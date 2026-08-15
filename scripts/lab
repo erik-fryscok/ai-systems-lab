@@ -22,7 +22,15 @@ import time
 import urllib.error
 import urllib.request
 import zlib
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
+
+
+SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
+import skill_eval
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -2043,6 +2051,148 @@ def restore_model_state(cfg, previous_non_embedding, previous_manual_unloaded, t
     update_service_state(manual_unloaded=False)
 
 
+@contextmanager
+def benchmark_model_session(cfg, model_id, timeout):
+    """Pin one local model for a benchmark and restore the exact prior session."""
+    snapshot = copy.deepcopy(load_service_state())
+    previous_non_embedding = active_model_ids(
+        cfg,
+        include_embeddings=False,
+        timeout=10,
+    )
+    benchmark_state = copy.deepcopy(snapshot)
+    benchmark_state.update(
+        {
+            "manual_unloaded": False,
+            "mode": "benchmark",
+            "pinned_model": model_id,
+        }
+    )
+    restore_transition_state = copy.deepcopy(snapshot)
+    restore_transition_state.update(
+        {
+            "manual_unloaded": False,
+            "mode": "benchmark",
+            "pinned_model": previous_non_embedding[0] if previous_non_embedding else model_id,
+        }
+    )
+    try:
+        save_service_state(benchmark_state)
+        switch_to_model(cfg, model_id, timeout=timeout)
+        yield
+    finally:
+        try:
+            # Move the benchmark pin to the prior model before loading it while
+            # keeping unrelated automatic switching excluded during restoration.
+            save_service_state(restore_transition_state)
+            if previous_non_embedding:
+                switch_to_model(cfg, previous_non_embedding[0], timeout=timeout)
+            else:
+                for active_model in active_model_ids(
+                    cfg,
+                    include_embeddings=False,
+                    timeout=10,
+                ):
+                    unload_model(cfg, active_model, quiet=True)
+                    wait_for_inactive(cfg, active_model, timeout=timeout)
+        finally:
+            save_service_state(snapshot)
+
+
+def cmd_skill_eval(args, cfg):
+    _cmd_skill_run(args, cfg, redteam=False)
+
+
+def cmd_skill_redteam(args, cfg):
+    _cmd_skill_run(args, cfg, redteam=True)
+
+
+def _cmd_skill_run(args, cfg, redteam):
+    try:
+        target = skill_eval.parse_target(args.target, cfg)
+        skill_eval.validate_judge(target, args.judge_model)
+        dependencies = require_skill_eval_dependencies()
+        if target.kind == "local":
+            model_files = model_weight_paths(cfg, target.model)
+            missing = [path for path in model_files if not path.exists()]
+            if missing:
+                raise LabError(
+                    "Local model preflight failed; missing files:\n"
+                    + "\n".join(f"  {path}" for path in missing)
+                )
+            try:
+                verify_responses_endpoint(cfg, args.timeout)
+            except LabError:
+                raise
+            except Exception as exc:
+                raise LabError(
+                    f"Local server Responses preflight failed at {api_base(cfg)}/v1/responses: {exc}"
+                ) from exc
+
+        skill_dir = Path(args.skill_dir).expanduser()
+        eval_dir = Path(args.eval_dir).expanduser() if args.eval_dir else None
+        contract = skill_eval.load_skill_contract(skill_dir, eval_dir)
+        package = skill_eval.validate_skill_package(skill_dir)
+        target_digest = hashlib.sha256(
+            f"{target.kind}:{target.model}".encode("utf-8")
+        ).hexdigest()[:8]
+        run_root = skill_eval.create_run_root(
+            paths(cfg)["state_dir"] / "skill-evals",
+            f"{now_stamp()}-{contract.skill_name}-{target.kind}-{target_digest}",
+        )
+        repetitions = 1 if redteam or args.profile == "smoke" else 5
+        staged_cases = skill_eval.stage_cases(
+            contract,
+            package,
+            repetitions,
+            run_root,
+            keep_workspaces_on_error=args.keep_workspaces,
+        )
+        config_path = run_root / "promptfooconfig.yaml"
+        raw_result_path = run_root / "promptfoo.json"
+        try:
+            if redteam:
+                redteam_builder = getattr(skill_eval, "build_redteam_config", None)
+                if redteam_builder is None:
+                    raise LabError(
+                        "skill-redteam configuration is not installed; complete the red-team profile setup first"
+                    )
+                redteam_config = redteam_builder(
+                    target,
+                    args.judge_model,
+                    staged_cases,
+                    args.profile,
+                )
+                skill_eval._write_promptfoo_config(config_path, redteam_config)
+            else:
+                skill_eval.build_promptfoo_config(
+                    target,
+                    args.judge_model,
+                    staged_cases,
+                    args.profile,
+                    config_path,
+                )
+
+            session = (
+                benchmark_model_session(cfg, target.model, args.timeout)
+                if target.kind == "local"
+                else nullcontext()
+            )
+            with session:
+                skill_eval.run_promptfoo(
+                    Path(dependencies["promptfoo"]),
+                    config_path,
+                    raw_result_path,
+                    args.timeout,
+                )
+        finally:
+            if not args.keep_workspaces:
+                skill_eval.cleanup_staged_cases(staged_cases, run_root)
+        print(raw_result_path)
+    except skill_eval.SkillEvalError as exc:
+        raise LabError(str(exc)) from exc
+
+
 def cmd_verify(args, cfg):
     model_id = resolve_selector(cfg, args.selector)
     if is_embedding_model(cfg, model_id):
@@ -3194,6 +3344,24 @@ def build_parser():
     export_public.add_argument("result_dir")
     export_public.add_argument("--output", required=True)
 
+    skill_eval_parser = sub.add_parser("skill-eval")
+    skill_eval_parser.add_argument("skill_dir")
+    skill_eval_parser.add_argument("--target", required=True)
+    skill_eval_parser.add_argument("--judge-model", required=True)
+    skill_eval_parser.add_argument("--eval-dir")
+    skill_eval_parser.add_argument("--profile", choices=["smoke", "release"], default="smoke")
+    skill_eval_parser.add_argument("--timeout", type=int, default=900)
+    skill_eval_parser.add_argument("--keep-workspaces", action="store_true")
+
+    skill_redteam_parser = sub.add_parser("skill-redteam")
+    skill_redteam_parser.add_argument("skill_dir")
+    skill_redteam_parser.add_argument("--target", required=True)
+    skill_redteam_parser.add_argument("--judge-model", required=True)
+    skill_redteam_parser.add_argument("--eval-dir")
+    skill_redteam_parser.add_argument("--profile", choices=["core", "deep"], default="core")
+    skill_redteam_parser.add_argument("--timeout", type=int, default=900)
+    skill_redteam_parser.add_argument("--keep-workspaces", action="store_true")
+
     return parser
 
 
@@ -3226,6 +3394,8 @@ COMMANDS = {
     "bench-llama": cmd_bench_llama,
     "bench-server": cmd_bench_server,
     "bench-quality": cmd_bench_quality,
+    "skill-eval": cmd_skill_eval,
+    "skill-redteam": cmd_skill_redteam,
     "export-public": cmd_export_public,
 }
 

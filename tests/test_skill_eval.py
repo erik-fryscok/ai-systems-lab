@@ -454,5 +454,55 @@ class PromptfooConfigTests(unittest.TestCase):
             skill_eval.validate_judge(self.local_target, " gpt-5.6-terra")
 
 
+class PromptfooExecutionTests(unittest.TestCase):
+    def setUp(self):
+        self.command = [
+            str(REPO_ROOT / "node_modules" / ".bin" / "promptfoo"),
+            "eval",
+            "--no-cache",
+            "--config",
+            "/private/run/promptfooconfig.yaml",
+            "--output",
+            "/private/run/promptfoo.json",
+        ]
+
+    def test_promptfoo_failure_propagates_and_uses_only_the_fixed_eval_command(self):
+        error = subprocess.CalledProcessError(7, self.command)
+        with mock.patch.object(skill_eval.subprocess, "run", side_effect=error) as run:
+            with self.assertRaises(subprocess.CalledProcessError) as raised:
+                skill_eval.run_promptfoo(
+                    REPO_ROOT / "node_modules" / ".bin" / "promptfoo",
+                    Path("/private/run/promptfooconfig.yaml"),
+                    Path("/private/run/promptfoo.json"),
+                    45,
+                )
+
+        self.assertIs(raised.exception, error)
+        run.assert_called_once_with(self.command, check=True, timeout=45)
+
+    def test_promptfoo_interrupt_propagates(self):
+        with mock.patch.object(
+            skill_eval.subprocess, "run", side_effect=KeyboardInterrupt
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                skill_eval.run_promptfoo(
+                    REPO_ROOT / "node_modules" / ".bin" / "promptfoo",
+                    Path("/private/run/promptfooconfig.yaml"),
+                    Path("/private/run/promptfoo.json"),
+                    45,
+                )
+
+    def test_promptfoo_timeout_becomes_a_skill_eval_error(self):
+        timeout = subprocess.TimeoutExpired(self.command, 45)
+        with mock.patch.object(skill_eval.subprocess, "run", side_effect=timeout):
+            with self.assertRaisesRegex(skill_eval.SkillEvalError, "timed out after 45 seconds"):
+                skill_eval.run_promptfoo(
+                    REPO_ROOT / "node_modules" / ".bin" / "promptfoo",
+                    Path("/private/run/promptfooconfig.yaml"),
+                    Path("/private/run/promptfoo.json"),
+                    45,
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

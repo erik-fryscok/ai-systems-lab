@@ -3,10 +3,11 @@ import importlib.util
 import io
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from argparse import Namespace
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -117,6 +118,295 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config["models"]["a"]["status"], "core")
         self.assertEqual(config["models"]["a"]["path"], "${home}/a.gguf")
         self.assertEqual(config["_local_config_path"], str(overlay.resolve()))
+
+
+class SkillEvalCommandTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.skill_dir = REPO_ROOT / "tests" / "fixtures" / "skill-project" / "skills" / "safe-skill"
+        self.eval_dir = REPO_ROOT / "tests" / "fixtures" / "skill-project" / ".skill-evals" / "safe-skill"
+        self.config = {
+            "paths": {
+                "models_dir": str(self.root / "models"),
+                "state_dir": str(self.root / "state"),
+            },
+            "server": {"host": "127.0.0.1", "port": 8080},
+            "models": {
+                "fast-9b": {
+                    "context_tokens": 32768,
+                    "files": ["fast.gguf"],
+                    "local_dir": "fast-9b",
+                    "preset": {},
+                    "roles": ["utility"],
+                }
+            },
+        }
+
+    def command_args(self, **changes):
+        values = {
+            "skill_dir": str(self.skill_dir),
+            "target": "local:fast-9b",
+            "judge_model": "gpt-5.6-terra",
+            "eval_dir": str(self.eval_dir),
+            "profile": "smoke",
+            "timeout": 30,
+            "keep_workspaces": False,
+        }
+        values.update(changes)
+        return Namespace(**values)
+
+    def install_local_model(self):
+        model_path = self.root / "models" / "fast-9b" / "fast.gguf"
+        model_path.parent.mkdir(parents=True, exist_ok=True)
+        model_path.touch()
+
+    def test_skill_eval_parser_requires_target_and_judge(self):
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            lab.build_parser().parse_args(
+                ["skill-eval", "tests/fixtures/skill-project/skills/safe-skill"]
+            )
+
+    def test_skill_commands_parse_their_public_profiles(self):
+        eval_args = lab.build_parser().parse_args(
+            [
+                "skill-eval",
+                "skill-dir",
+                "--target",
+                "local:fast-9b",
+                "--judge-model",
+                "gpt-5.6-terra",
+            ]
+        )
+        redteam_args = lab.build_parser().parse_args(
+            [
+                "skill-redteam",
+                "skill-dir",
+                "--target",
+                "openai:gpt-5.6-terra",
+                "--judge-model",
+                "gpt-5.6",
+                "--profile",
+                "deep",
+            ]
+        )
+
+        self.assertEqual(eval_args.profile, "smoke")
+        self.assertEqual(eval_args.timeout, 900)
+        self.assertFalse(eval_args.keep_workspaces)
+        self.assertEqual(redteam_args.profile, "deep")
+
+    def test_skill_eval_rejects_an_invalid_target_before_dependency_or_inference_checks(self):
+        args = Namespace(
+            skill_dir="skill-dir",
+            target="local:missing",
+            judge_model="gpt-5.6-terra",
+            eval_dir=None,
+            profile="smoke",
+            timeout=30,
+            keep_workspaces=False,
+        )
+        config = {"models": {}}
+
+        with mock.patch.object(lab, "require_skill_eval_dependencies") as dependencies:
+            with self.assertRaisesRegex(lab.LabError, "unknown local model"):
+                lab.cmd_skill_eval(args, config)
+
+        dependencies.assert_not_called()
+
+    def test_local_skill_eval_missing_assets_fail_before_staging_or_state_changes(self):
+        with mock.patch.object(
+            lab, "require_skill_eval_dependencies", return_value={"promptfoo": "/promptfoo"}
+        ), mock.patch.object(
+            lab.skill_eval, "stage_cases"
+        ) as stage_cases, mock.patch.object(
+            lab, "verify_responses_endpoint"
+        ) as verify_responses, mock.patch.object(
+            lab, "benchmark_model_session"
+        ) as benchmark_session:
+            with self.assertRaisesRegex(lab.LabError, "missing files"):
+                lab.cmd_skill_eval(self.command_args(), self.config)
+
+        stage_cases.assert_not_called()
+        verify_responses.assert_not_called()
+        benchmark_session.assert_not_called()
+
+    def test_local_skill_eval_responses_preflight_fails_before_staging_or_state_changes(self):
+        self.install_local_model()
+        with mock.patch.object(
+            lab, "require_skill_eval_dependencies", return_value={"promptfoo": "/promptfoo"}
+        ), mock.patch.object(
+            lab.skill_eval, "stage_cases"
+        ) as stage_cases, mock.patch.object(
+            lab,
+            "verify_responses_endpoint",
+            side_effect=lab.LabError("responses unavailable"),
+        ), mock.patch.object(
+            lab, "benchmark_model_session"
+        ) as benchmark_session:
+            with self.assertRaisesRegex(lab.LabError, "responses unavailable"):
+                lab.cmd_skill_eval(self.command_args(), self.config)
+
+        stage_cases.assert_not_called()
+        benchmark_session.assert_not_called()
+
+    def test_promptfoo_failure_restores_and_removes_staged_workspaces_by_default(self):
+        self.install_local_model()
+        snapshot = {
+            "auto_idle_enabled": True,
+            "auto_idle_seconds": 900,
+            "manual_unloaded": False,
+            "mode": "cline",
+            "pinned_model": None,
+        }
+        promptfoo_error = subprocess.CalledProcessError(9, ["promptfoo"])
+        with mock.patch.object(
+            lab, "require_skill_eval_dependencies", return_value={"promptfoo": "/promptfoo"}
+        ), mock.patch.object(
+            lab, "verify_responses_endpoint"
+        ), mock.patch.object(
+            lab, "load_service_state", return_value=dict(snapshot)
+        ), mock.patch.object(
+            lab, "active_model_ids", return_value=["previous-13b"]
+        ), mock.patch.object(
+            lab, "switch_to_model"
+        ) as switch_model, mock.patch.object(
+            lab, "save_service_state"
+        ) as save_state, mock.patch.object(
+            lab.skill_eval, "run_promptfoo", side_effect=promptfoo_error
+        ) as run_promptfoo:
+            with self.assertRaises(subprocess.CalledProcessError):
+                lab.cmd_skill_eval(self.command_args(), self.config)
+
+        run_root = run_promptfoo.call_args.args[1].parent
+        self.assertEqual(
+            switch_model.call_args_list,
+            [
+                mock.call(self.config, "fast-9b", timeout=30),
+                mock.call(self.config, "previous-13b", timeout=30),
+            ],
+        )
+        self.assertEqual(save_state.call_args_list[-1], mock.call(snapshot))
+        self.assertEqual(list((run_root / "workspaces").iterdir()), [])
+        self.assertEqual(list((run_root / "codex-homes").iterdir()), [])
+
+    def test_promptfoo_interrupt_restores_and_keep_workspaces_retains_staging(self):
+        self.install_local_model()
+        snapshot = {
+            "auto_idle_enabled": True,
+            "auto_idle_seconds": 900,
+            "manual_unloaded": True,
+            "mode": "benchmark",
+            "pinned_model": "previous-13b",
+        }
+        with mock.patch.object(
+            lab, "require_skill_eval_dependencies", return_value={"promptfoo": "/promptfoo"}
+        ), mock.patch.object(
+            lab, "verify_responses_endpoint"
+        ), mock.patch.object(
+            lab, "load_service_state", return_value=dict(snapshot)
+        ), mock.patch.object(
+            lab, "active_model_ids", return_value=["previous-13b"]
+        ), mock.patch.object(
+            lab, "switch_to_model"
+        ), mock.patch.object(
+            lab, "save_service_state"
+        ) as save_state, mock.patch.object(
+            lab.skill_eval, "run_promptfoo", side_effect=KeyboardInterrupt
+        ) as run_promptfoo:
+            with self.assertRaises(KeyboardInterrupt):
+                lab.cmd_skill_eval(
+                    self.command_args(keep_workspaces=True),
+                    self.config,
+                )
+
+        run_root = run_promptfoo.call_args.args[1].parent
+        self.assertEqual(save_state.call_args_list[-1], mock.call(snapshot))
+        self.assertTrue(any((run_root / "workspaces").iterdir()))
+        self.assertTrue(any((run_root / "codex-homes").iterdir()))
+
+    def test_successful_cloud_eval_removes_staged_workspaces_without_local_preflight(self):
+        with mock.patch.object(
+            lab, "require_skill_eval_dependencies", return_value={"promptfoo": "/promptfoo"}
+        ), mock.patch.object(
+            lab, "verify_responses_endpoint"
+        ) as verify_responses, mock.patch.object(
+            lab, "benchmark_model_session"
+        ) as benchmark_session, mock.patch.object(
+            lab.skill_eval, "run_promptfoo"
+        ) as run_promptfoo, redirect_stdout(io.StringIO()):
+            lab.cmd_skill_eval(
+                self.command_args(target="openai:gpt-5.6-terra", judge_model="gpt-5.6"),
+                self.config,
+            )
+
+        run_root = run_promptfoo.call_args.args[1].parent
+        verify_responses.assert_not_called()
+        benchmark_session.assert_not_called()
+        self.assertEqual(list((run_root / "workspaces").iterdir()), [])
+        self.assertEqual(list((run_root / "codex-homes").iterdir()), [])
+        self.assertTrue((run_root / "promptfooconfig.yaml").is_file())
+        self.assertTrue((run_root / "verifiers").is_dir())
+
+    def test_config_failure_also_cleans_staged_workspaces_by_default(self):
+        with mock.patch.object(
+            lab, "require_skill_eval_dependencies", return_value={"promptfoo": "/promptfoo"}
+        ), mock.patch.object(
+            lab.skill_eval,
+            "build_promptfoo_config",
+            side_effect=lab.skill_eval.SkillEvalError("config rejected"),
+        ), mock.patch.object(
+            lab.skill_eval,
+            "cleanup_staged_cases",
+            wraps=lab.skill_eval.cleanup_staged_cases,
+        ) as cleanup:
+            with self.assertRaisesRegex(lab.LabError, "config rejected"):
+                lab.cmd_skill_eval(
+                    self.command_args(target="openai:gpt-5.6-terra", judge_model="gpt-5.6"),
+                    self.config,
+                )
+
+        cleanup.assert_called_once()
+        run_root = cleanup.call_args.args[1]
+        self.assertEqual(list((run_root / "workspaces").iterdir()), [])
+        self.assertEqual(list((run_root / "codex-homes").iterdir()), [])
+
+    def test_same_second_runs_allocate_distinct_roots(self):
+        with mock.patch.object(
+            lab, "require_skill_eval_dependencies", return_value={"promptfoo": "/promptfoo"}
+        ), mock.patch.object(
+            lab, "now_stamp", return_value="20260815-120000"
+        ), mock.patch.object(
+            lab.skill_eval, "run_promptfoo"
+        ) as run_promptfoo, redirect_stdout(io.StringIO()):
+            args = self.command_args(target="openai:gpt-5.6-terra", judge_model="gpt-5.6")
+            lab.cmd_skill_eval(args, self.config)
+            lab.cmd_skill_eval(args, self.config)
+
+        run_roots = [call.args[1].parent for call in run_promptfoo.call_args_list]
+        self.assertEqual(len(run_roots), 2)
+        self.assertNotEqual(run_roots[0], run_roots[1])
+        self.assertTrue(all((run_root / "promptfooconfig.yaml").is_file() for run_root in run_roots))
+
+    def test_staging_failure_rolls_back_partial_workspaces_by_default(self):
+        with mock.patch.object(
+            lab, "require_skill_eval_dependencies", return_value={"promptfoo": "/promptfoo"}
+        ), mock.patch.object(
+            lab.skill_eval,
+            "_initialize_pristine_git_repository",
+            side_effect=lab.skill_eval.SkillEvalError("git setup failed"),
+        ):
+            with self.assertRaisesRegex(lab.LabError, "git setup failed"):
+                lab.cmd_skill_eval(
+                    self.command_args(target="openai:gpt-5.6-terra", judge_model="gpt-5.6"),
+                    self.config,
+                )
+
+        run_roots = list((self.root / "state" / "skill-evals").iterdir())
+        self.assertEqual(len(run_roots), 1)
+        self.assertEqual(list((run_roots[0] / "workspaces").iterdir()), [])
+        self.assertEqual(list((run_roots[0] / "codex-homes").iterdir()), [])
 
 
 class CatalogTests(unittest.TestCase):
@@ -305,6 +595,166 @@ class VerificationTests(unittest.TestCase):
                     lab.cmd_verify(args, config)
 
         update_state.assert_not_called()
+
+
+class BenchmarkModelSessionTests(unittest.TestCase):
+    def setUp(self):
+        self.config = {
+            "models": {
+                "fast-9b": {"roles": ["utility"]},
+                "previous-13b": {"roles": ["coding"]},
+            }
+        }
+        self.snapshot = {
+            "auto_idle_enabled": False,
+            "auto_idle_seconds": 321,
+            "manual_unloaded": True,
+            "mode": "benchmark",
+            "pinned_model": "previous-13b",
+        }
+
+    def test_benchmark_session_restores_exact_state_and_active_model_after_interrupt(self):
+        with mock.patch.object(
+            lab, "load_service_state", return_value=dict(self.snapshot)
+        ), mock.patch.object(
+            lab, "active_model_ids", return_value=["previous-13b"]
+        ), mock.patch.object(
+            lab, "save_service_state"
+        ) as save_state, mock.patch.object(
+            lab, "switch_to_model"
+        ) as switch_model:
+            with self.assertRaises(KeyboardInterrupt):
+                with lab.benchmark_model_session(self.config, "fast-9b", 30):
+                    raise KeyboardInterrupt
+
+        self.assertEqual(
+            switch_model.call_args_list,
+            [
+                mock.call(self.config, "fast-9b", timeout=30),
+                mock.call(self.config, "previous-13b", timeout=30),
+            ],
+        )
+        self.assertEqual(
+            save_state.call_args_list,
+            [
+                mock.call(
+                    {
+                        "auto_idle_enabled": False,
+                        "auto_idle_seconds": 321,
+                        "manual_unloaded": False,
+                        "mode": "benchmark",
+                        "pinned_model": "fast-9b",
+                    }
+                ),
+                mock.call(
+                    {
+                        "auto_idle_enabled": False,
+                        "auto_idle_seconds": 321,
+                        "manual_unloaded": False,
+                        "mode": "benchmark",
+                        "pinned_model": "previous-13b",
+                    }
+                ),
+                mock.call(self.snapshot),
+            ],
+        )
+
+    def test_benchmark_session_restores_an_unloaded_manual_state(self):
+        snapshot = {
+            **self.snapshot,
+            "mode": "cline",
+            "pinned_model": None,
+            "manual_unloaded": True,
+        }
+        active_models = mock.Mock(side_effect=[[], ["fast-9b"]])
+
+        with mock.patch.object(
+            lab, "load_service_state", return_value=dict(snapshot)
+        ), mock.patch.object(
+            lab, "active_model_ids", active_models
+        ), mock.patch.object(
+            lab, "save_service_state"
+        ) as save_state, mock.patch.object(
+            lab, "switch_to_model"
+        ), mock.patch.object(
+            lab, "unload_model"
+        ) as unload, mock.patch.object(
+            lab, "wait_for_inactive"
+        ) as wait_for_inactive:
+            with lab.benchmark_model_session(self.config, "fast-9b", 30):
+                pass
+
+        unload.assert_called_once_with(self.config, "fast-9b", quiet=True)
+        wait_for_inactive.assert_called_once_with(self.config, "fast-9b", timeout=30)
+        self.assertEqual(save_state.call_args_list[-1], mock.call(snapshot))
+
+    def test_benchmark_session_restores_when_the_benchmark_state_write_interrupts(self):
+        saved_states = []
+
+        def interrupt_after_write(state):
+            saved_states.append(dict(state))
+            if len(saved_states) == 1:
+                raise KeyboardInterrupt
+
+        with mock.patch.object(
+            lab, "load_service_state", return_value=dict(self.snapshot)
+        ), mock.patch.object(
+            lab, "active_model_ids", return_value=["previous-13b"]
+        ), mock.patch.object(
+            lab, "save_service_state", side_effect=interrupt_after_write
+        ), mock.patch.object(
+            lab, "switch_to_model"
+        ) as switch_model:
+            with self.assertRaises(KeyboardInterrupt):
+                with lab.benchmark_model_session(self.config, "fast-9b", 30):
+                    pass
+
+        self.assertEqual(saved_states[-1], self.snapshot)
+        switch_model.assert_called_once_with(self.config, "previous-13b", timeout=30)
+
+    def test_benchmark_session_allows_gateway_to_reload_the_previous_pin(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ,
+            {"LOCAL_AI_LAB_STATE_PATH": str(Path(directory) / "state.json")},
+            clear=False,
+        ):
+            models_dir = Path(directory) / "models"
+            for model_id in ("fast-9b", "previous-13b", "third-7b"):
+                model_dir = models_dir / model_id
+                model_dir.mkdir(parents=True)
+                (model_dir / f"{model_id}.gguf").touch()
+            config = {
+                "paths": {"models_dir": str(models_dir), "state_dir": str(Path(directory) / "runtime")},
+                "models": {
+                    model_id: {
+                        "files": [f"{model_id}.gguf"],
+                        "local_dir": model_id,
+                        "preset": {},
+                    }
+                    for model_id in ("fast-9b", "previous-13b", "third-7b")
+                },
+            }
+            lab.save_service_state(self.snapshot)
+            gateway = lab.Gateway(config)
+            self.addCleanup(gateway.close)
+
+            def gateway_switch(_cfg, model_id, timeout):
+                if model_id == "previous-13b":
+                    with self.assertRaisesRegex(lab.LabError, "automatic switching is disabled"):
+                        gateway.ensure_model("third-7b")
+                return gateway.ensure_model(model_id)
+
+            with mock.patch.object(
+                gateway, "_status", return_value=("loaded", {})
+            ), mock.patch.object(
+                lab, "active_model_ids", return_value=["previous-13b"]
+            ), mock.patch.object(
+                lab, "switch_to_model", side_effect=gateway_switch
+            ):
+                with lab.benchmark_model_session(config, "fast-9b", 30):
+                    pass
+
+            self.assertEqual(lab.load_service_state(), self.snapshot)
 
 
 class GatewayTests(unittest.TestCase):

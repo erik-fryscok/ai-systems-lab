@@ -5,6 +5,7 @@ import json
 import secrets
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -163,10 +164,13 @@ def stage_cases(
     package: SkillPackage,
     repetitions: int,
     run_root: Path,
+    keep_workspaces_on_error: bool = False,
 ) -> list[StagedCase]:
     """Stage one isolated, pristine workspace for every case and repetition."""
     if not isinstance(repetitions, int) or isinstance(repetitions, bool) or repetitions < 1:
         raise SkillEvalError("repetitions must be a positive integer")
+    if not isinstance(keep_workspaces_on_error, bool):
+        raise SkillEvalError("keep_workspaces_on_error must be a boolean")
 
     eval_dir = _require_directory(contract.eval_dir, "eval directory")
     validated_package = validate_skill_package(package.skill_dir)
@@ -181,51 +185,60 @@ def stage_cases(
     verifier_root = _create_child_directory(resolved_run_root, "verifiers")
 
     staged = []
-    for case in contract.cases:
-        fixture = _validated_fixture_for_staging(case.fixture, eval_dir)
-        _require_safe_case_id(case.case_id)
-        for repetition in range(1, repetitions + 1):
-            row_name = f"{case.case_id}-{repetition}"
-            workspace_dir = _new_child_directory(workspace_root, row_name, "workspace")
-            codex_home = _new_child_directory(codex_root, row_name, "CODEX_HOME")
-            _copy_fixture(fixture, workspace_dir)
-            baseline_hashes = MappingProxyType(_hash_regular_files(workspace_dir))
-            _initialize_pristine_git_repository(workspace_dir)
-            _install_runtime_skill(validated_package, workspace_dir, contract.skill_name)
+    created_directories: list[tuple[Path, Path, str]] = []
+    try:
+        for case in contract.cases:
+            fixture = _validated_fixture_for_staging(case.fixture, eval_dir)
+            _require_safe_case_id(case.case_id)
+            for repetition in range(1, repetitions + 1):
+                row_name = f"{case.case_id}-{repetition}"
+                workspace_dir = _new_child_directory(workspace_root, row_name, "workspace")
+                created_directories.append((workspace_dir, workspace_root, "workspace"))
+                codex_home = _new_child_directory(codex_root, row_name, "CODEX_HOME")
+                created_directories.append((codex_home, codex_root, "CODEX_HOME"))
+                _copy_fixture(fixture, workspace_dir)
+                baseline_hashes = MappingProxyType(_hash_regular_files(workspace_dir))
+                _initialize_pristine_git_repository(workspace_dir)
+                _install_runtime_skill(validated_package, workspace_dir, contract.skill_name)
 
-            canaries = MappingProxyType(_new_canaries(row_name))
-            canary_controls = _materialize_canary_controls(codex_home, canaries)
-            verifier_path = _new_child_file(verifier_root, f"{row_name}.json", "verifier configuration")
-            verifier_path.write_text(
-                json.dumps(
-                    {
-                        "baseline_hashes": dict(baseline_hashes),
-                        "canaries": dict(canaries),
-                        "canary_controls": canary_controls,
-                        "case_id": case.case_id,
-                        "package_digest": validated_package.digest,
-                        "repetition": repetition,
-                        "sandbox": case.sandbox,
-                    },
-                    indent=2,
-                    sort_keys=True,
+                canaries = MappingProxyType(_new_canaries(row_name))
+                canary_controls = _materialize_canary_controls(codex_home, canaries)
+                verifier_path = _new_child_file(verifier_root, f"{row_name}.json", "verifier configuration")
+                verifier_path.write_text(
+                    json.dumps(
+                        {
+                            "baseline_hashes": dict(baseline_hashes),
+                            "canaries": dict(canaries),
+                            "canary_controls": canary_controls,
+                            "case_id": case.case_id,
+                            "package_digest": validated_package.digest,
+                            "repetition": repetition,
+                            "sandbox": case.sandbox,
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n",
+                    encoding="utf-8",
                 )
-                + "\n",
-                encoding="utf-8",
-            )
-            staged.append(
-                StagedCase(
-                    case_id=case.case_id,
-                    repetition=repetition,
-                    workspace_dir=workspace_dir,
-                    codex_home=codex_home,
-                    sandbox=case.sandbox,
-                    canaries=canaries,
-                    baseline_hashes=baseline_hashes,
-                    case=case,
-                    skill_name=contract.skill_name,
+                staged.append(
+                    StagedCase(
+                        case_id=case.case_id,
+                        repetition=repetition,
+                        workspace_dir=workspace_dir,
+                        codex_home=codex_home,
+                        sandbox=case.sandbox,
+                        canaries=canaries,
+                        baseline_hashes=baseline_hashes,
+                        case=case,
+                        skill_name=contract.skill_name,
+                    )
                 )
-            )
+    except BaseException:
+        if not keep_workspaces_on_error:
+            for directory, parent, label in reversed(created_directories):
+                _remove_staged_directory(directory, parent, label)
+        raise
     return staged
 
 
@@ -332,6 +345,75 @@ def build_promptfoo_config(
     }
     _write_promptfoo_config(output_path, config)
     return config
+
+
+def run_promptfoo(
+    promptfoo_binary: Path,
+    config_path: Path,
+    raw_result_path: Path,
+    timeout: int,
+) -> None:
+    """Run the pinned project Promptfoo with the fixed no-cache eval command."""
+    command = [
+        str(promptfoo_binary),
+        "eval",
+        "--no-cache",
+        "--config",
+        str(config_path),
+        "--output",
+        str(raw_result_path),
+    ]
+    try:
+        subprocess.run(command, check=True, timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        raise SkillEvalError(f"Promptfoo timed out after {timeout} seconds") from error
+
+
+def create_run_root(runs_root: Path, prefix: str) -> Path:
+    """Atomically allocate a unique private run directory."""
+    parent = Path(runs_root)
+    if parent.is_symlink():
+        raise SkillEvalError("skill evaluation runs root must not be a symlink")
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+        candidate = Path(tempfile.mkdtemp(prefix=f"{prefix}-", dir=parent))
+    except OSError as error:
+        raise SkillEvalError(f"could not create skill evaluation run root: {error}") from error
+    return _require_directory(candidate, "run root")
+
+
+def cleanup_staged_cases(staged_cases: list[StagedCase], run_root: Path) -> None:
+    """Remove only the explicit per-row workspace and CODEX_HOME directories."""
+    root = _require_directory(run_root, "run root")
+    expected_parents = {
+        "workspace": _require_directory(root / "workspaces", "workspace root"),
+        "CODEX_HOME": _require_directory(root / "codex-homes", "CODEX_HOME root"),
+    }
+    for row in staged_cases:
+        if not isinstance(row, StagedCase):
+            raise SkillEvalError("staged cases must contain StagedCase entries")
+        for label, candidate in (
+            ("workspace", row.workspace_dir),
+            ("CODEX_HOME", row.codex_home),
+        ):
+            _remove_staged_directory(candidate, expected_parents[label], label)
+
+
+def _remove_staged_directory(candidate: Path, parent: Path, label: str) -> None:
+    path = Path(candidate)
+    if path.is_symlink():
+        raise SkillEvalError(f"refusing to remove symlinked {label}: {path}")
+    try:
+        resolved = path.resolve()
+        relative = resolved.relative_to(parent)
+    except ValueError as error:
+        raise SkillEvalError(f"refusing to remove {label} outside its staging root") from error
+    if len(relative.parts) != 1:
+        raise SkillEvalError(f"refusing to remove nested {label} path")
+    if resolved.exists():
+        if not resolved.is_dir():
+            raise SkillEvalError(f"refusing to remove non-directory {label}: {resolved}")
+        shutil.rmtree(resolved)
 
 
 def _promptfoo_test(row: StagedCase, judge_model: str) -> dict[str, Any]:
