@@ -422,9 +422,10 @@ Before publishing any result, create a sanitized artifact:
   --output /tmp/public-result.json
 ```
 
-The export omits raw answers, evaluation payloads, commands, private repository
-metadata, local paths, host details, response identifiers, and credentials. Raw
-benchmark state remains private.
+The export omits raw answers, evaluation payloads, commands, local paths, host
+details, response identifiers, and credentials. Raw results remain locally
+ignored under `benchmarks/results/`. Export and publish only reviewed,
+sanitized summaries.
 
 The comparison contract, result hierarchy, publication fields, and scenario
 matrix are documented in
@@ -446,3 +447,7 @@ The optional paid quality judge uses OpenAI's
 [Responses API](https://developers.openai.com/api/docs/guides/migrate-to-responses)
 and [Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs)
 for schema-constrained judge responses.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
