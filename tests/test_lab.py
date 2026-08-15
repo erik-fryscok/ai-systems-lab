@@ -756,6 +756,75 @@ class BenchmarkModelSessionTests(unittest.TestCase):
 
             self.assertEqual(lab.load_service_state(), self.snapshot)
 
+    def test_empty_residency_restore_rejects_same_target_reload_race(self):
+        snapshot = {
+            **self.snapshot,
+            "mode": "cline",
+            "pinned_model": None,
+            "manual_unloaded": True,
+        }
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ,
+            {"LOCAL_AI_LAB_STATE_PATH": str(Path(directory) / "state.json")},
+            clear=False,
+        ):
+            models_dir = Path(directory) / "models"
+            model_dir = models_dir / "fast-9b"
+            model_dir.mkdir(parents=True)
+            (model_dir / "fast-9b.gguf").touch()
+            config = {
+                "paths": {"models_dir": str(models_dir), "state_dir": str(Path(directory) / "runtime")},
+                "models": {
+                    "fast-9b": {
+                        "files": ["fast-9b.gguf"],
+                        "local_dir": "fast-9b",
+                        "preset": {},
+                    }
+                },
+            }
+            lab.save_service_state(snapshot)
+            gateway = lab.Gateway(config)
+            self.addCleanup(gateway.close)
+            active_models = set()
+            reload_rejected = []
+
+            def active_model_ids(_cfg, **_kwargs):
+                return sorted(active_models)
+
+            def switch_model(_cfg, model_id, timeout):
+                active_models.clear()
+                active_models.add(model_id)
+
+            def unload_model(_cfg, model_id, quiet):
+                active_models.discard(model_id)
+
+            def wait_for_inactive(_cfg, model_id, timeout):
+                self.assertNotIn(model_id, active_models)
+                try:
+                    gateway.ensure_model(model_id)
+                except lab.LabError:
+                    reload_rejected.append(model_id)
+                else:
+                    active_models.add(model_id)
+
+            with mock.patch.object(
+                gateway, "_status", return_value=("loaded", {})
+            ), mock.patch.object(
+                lab, "active_model_ids", side_effect=active_model_ids
+            ), mock.patch.object(
+                lab, "switch_to_model", side_effect=switch_model
+            ), mock.patch.object(
+                lab, "unload_model", side_effect=unload_model
+            ), mock.patch.object(
+                lab, "wait_for_inactive", side_effect=wait_for_inactive
+            ):
+                with lab.benchmark_model_session(config, "fast-9b", 30):
+                    pass
+
+            self.assertEqual(reload_rejected, ["fast-9b"])
+            self.assertEqual(active_models, set())
+            self.assertEqual(lab.load_service_state(), snapshot)
+
 
 class GatewayTests(unittest.TestCase):
     def test_backend_uses_private_port_while_gateway_keeps_client_port(self):

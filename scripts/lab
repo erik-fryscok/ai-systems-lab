@@ -2073,7 +2073,7 @@ def benchmark_model_session(cfg, model_id, timeout):
         {
             "manual_unloaded": False,
             "mode": "benchmark",
-            "pinned_model": previous_non_embedding[0] if previous_non_embedding else model_id,
+            "pinned_model": previous_non_embedding[0] if previous_non_embedding else None,
         }
     )
     try:
@@ -2082,8 +2082,8 @@ def benchmark_model_session(cfg, model_id, timeout):
         yield
     finally:
         try:
-            # Move the benchmark pin to the prior model before loading it while
-            # keeping unrelated automatic switching excluded during restoration.
+            # Pin only the prior model while reloading it, or pin no model while
+            # restoring empty residency, so switching stays excluded throughout.
             save_service_state(restore_transition_state)
             if previous_non_embedding:
                 switch_to_model(cfg, previous_non_embedding[0], timeout=timeout)
