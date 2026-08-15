@@ -100,6 +100,17 @@ class ProviderConfigTests(unittest.TestCase):
         self.assertEqual(payload["text"]["format"]["schema"], schema)
         self.assertEqual(headers, {"Authorization": "Bearer secret-value"})
 
+    def test_responses_request_rejects_unsupported_provider_before_credentials(self):
+        target = resolve_model_target(
+            self.config, "cloud-coder", "http://127.0.0.1:8080/v1"
+        )
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(
+                ProviderConfigError, "does not support the Responses API judge"
+            ):
+                responses_json_request(target, "Score.", "input", {}, "low")
+
 
 if __name__ == "__main__":
     unittest.main()

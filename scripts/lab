@@ -2798,6 +2798,11 @@ def response_output_text(response):
 
 
 def judge_config(cfg, args):
+    if args.judge_base_url:
+        raise LabError(
+            "--judge-base-url is no longer supported; "
+            "configure providers.<name>.base_url instead."
+        )
     judge = cfg.get("benchmarks", {}).get("judge", {})
     provider = args.judge_provider or judge.get("provider", "manual")
     legacy_providers = {

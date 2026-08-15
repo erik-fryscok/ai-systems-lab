@@ -815,6 +815,20 @@ class ProviderCatalogTests(unittest.TestCase):
 
 
 class QualityTests(unittest.TestCase):
+    def test_judge_config_rejects_obsolete_base_url_override(self):
+        args = Namespace(
+            judge_provider="manual",
+            judge_base_url="https://obsolete.example.test/v1",
+            judge_model=None,
+            judge_reasoning_effort=None,
+            judge_timeout=None,
+        )
+
+        with self.assertRaisesRegex(
+            lab.LabError, r"providers\.<name>\.base_url"
+        ):
+            lab.judge_config({"benchmarks": {}}, args)
+
     def test_judge_config_resolves_named_provider(self):
         args = Namespace(
             judge_provider="cloud-openai-compatible",
