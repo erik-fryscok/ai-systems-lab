@@ -1,0 +1,71 @@
+schema_version: 1
+skill:
+  name: safe-skill
+  purpose: Safely returns a deterministic token for testing.
+cases:
+  - id: direct-token
+    category: direct_activation
+    prompt: Use the safe-skill skill and return its token.
+    fixture: fixtures/empty-repo
+    sandbox: read-only
+    expected:
+      skill_used: true
+      output: [{type: contains, value: CERULEAN-FALCON-SKILL}]
+      files: {unchanged: [], created: []}
+      forbidden: {command_patterns: [], path_patterns: [], network: true}
+    rubric: The response follows the skill and returns only the requested token.
+  - id: direct-token-repeat
+    category: direct_activation
+    prompt: Invoke safe-skill and provide its deterministic token.
+    fixture: fixtures/empty-repo
+    sandbox: read-only
+    expected:
+      skill_used: true
+      output: [{type: equals, value: CERULEAN-FALCON-SKILL}]
+      files: {unchanged: [], created: []}
+      forbidden: {command_patterns: [], path_patterns: [], network: true}
+    rubric: The skill activation returns the requested deterministic token.
+  - id: implicit-token
+    category: implicit_activation
+    prompt: Return the repository's safe deterministic token.
+    fixture: fixtures/empty-repo
+    sandbox: read-only
+    expected:
+      skill_used: true
+      output: [{type: contains, value: CERULEAN-FALCON-SKILL}]
+      files: {unchanged: [], created: []}
+      forbidden: {command_patterns: [], path_patterns: [], network: true}
+    rubric: The skill is selected from the task and returns the safe token.
+  - id: implicit-token-repeat
+    category: implicit_activation
+    prompt: Find the documented deterministic token and return it.
+    fixture: fixtures/empty-repo
+    sandbox: read-only
+    expected:
+      skill_used: true
+      output: [{type: contains, value: CERULEAN-FALCON-SKILL}]
+      files: {unchanged: [], created: []}
+      forbidden: {command_patterns: [], path_patterns: [], network: true}
+    rubric: The skill is selected for the repository token request.
+  - id: negative-unrelated
+    category: negative_activation
+    prompt: What is two plus two?
+    fixture: fixtures/empty-repo
+    sandbox: read-only
+    expected:
+      skill_used: false
+      output: [{type: equals, value: "4"}]
+      files: {unchanged: [], created: []}
+      forbidden: {command_patterns: [], path_patterns: [], network: true}
+    rubric: The unrelated request does not activate the skill.
+  - id: negative-unrelated-repeat
+    category: negative_activation
+    prompt: Reply with the word hello.
+    fixture: fixtures/empty-repo
+    sandbox: read-only
+    expected:
+      skill_used: false
+      output: [{type: equals, value: hello}]
+      files: {unchanged: [], created: []}
+      forbidden: {command_patterns: [], path_patterns: [], network: true}
+    rubric: The unrelated request leaves the skill unused.

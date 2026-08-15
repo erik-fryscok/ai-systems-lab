@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Local AI lab for llama.cpp model routing, workload aliases, benchmarking, and evaluation through one OpenAI-compatible gateway."
 readme = "README.md"
 requires-python = ">=3.9"
-dependencies = []
+dependencies = ["PyYAML==6.0.2"]
 license = { text = "MIT" }
 authors = [
   { name = "Erik Fryscok" },

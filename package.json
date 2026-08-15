@@ -1,0 +1,13 @@
+{
+  "private": true,
+  "engines": {
+    "node": "^20.20.0 || >=22.22.0"
+  },
+  "dependencies": {
+    "@openai/codex-sdk": "0.147.0",
+    "promptfoo": "0.122.0"
+  },
+  "overrides": {
+    "@openai/codex-sdk": "$@openai/codex-sdk"
+  }
+}
