@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -276,6 +277,50 @@ class SkillWorkspaceTests(unittest.TestCase):
         self.assertFalse(str(self.run_root / "verifiers").startswith(str(rows[0].workspace_dir)))
         self.assertEqual(set(rows[0].canaries), {"environment", "file", "terminal", "network"})
         self.assertTrue(rows[0].baseline_hashes["README.md"])
+
+    def test_git_backed_skill_is_rejected_before_metadata_reaches_a_workspace(self):
+        subprocess.run(("git", "init", "--quiet"), cwd=self.skill_dir, check=True)
+
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "git metadata"):
+            skill_eval.stage_cases(self.contract, self.package, 1, self.run_root)
+
+        self.assertFalse((self.run_root / "workspaces").exists())
+
+    def test_fixture_with_an_embedded_git_directory_is_rejected_before_staging(self):
+        embedded_git = self.eval_dir / "fixtures" / "empty-repo" / "vendor" / ".git"
+        embedded_git.mkdir(parents=True)
+        (embedded_git / "config").write_text("[core]\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "git metadata"):
+            skill_eval.stage_cases(self.contract, self.package, 1, self.run_root)
+
+        self.assertFalse((self.run_root / "workspaces" / "direct-token-1").exists())
+
+    def test_each_row_materializes_synthetic_canary_controls_outside_the_workspace(self):
+        row = skill_eval.stage_cases(self.contract, self.package, 1, self.run_root)[0]
+        controls_dir = row.codex_home / "skill-eval-controls"
+        environment = json.loads((controls_dir / "environment.json").read_text(encoding="utf-8"))
+        network = json.loads((controls_dir / "network.json").read_text(encoding="utf-8"))
+        terminal = controls_dir / "terminal-receipt"
+        verifier = json.loads(
+            (self.run_root / "verifiers" / "direct-token-1.json").read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(environment, {"SKILL_EVAL_CANARY_RECEIPT": row.canaries["environment"]})
+        self.assertEqual((controls_dir / "file-receipt.txt").read_text(encoding="utf-8"), row.canaries["file"])
+        self.assertEqual(
+            subprocess.run((str(terminal),), check=True, capture_output=True, text=True).stdout.strip(),
+            row.canaries["terminal"],
+        )
+        self.assertEqual(network["url"], row.canaries["network"])
+        self.assertEqual(verifier["canary_controls"]["directory"], str(controls_dir))
+        self.assertFalse(controls_dir.is_relative_to(row.workspace_dir))
+
+    def test_canary_controls_remain_unique_when_the_random_source_repeats(self):
+        with mock.patch.object(skill_eval.secrets, "token_urlsafe", return_value="repeated"):
+            rows = skill_eval.stage_cases(self.contract, self.package, 2, self.run_root)
+
+        self.assertNotEqual(rows[0].canaries, rows[1].canaries)
 
 
 if __name__ == "__main__":

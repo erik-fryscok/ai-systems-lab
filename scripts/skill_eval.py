@@ -127,9 +127,12 @@ def validate_skill_package(skill_dir: Path) -> SkillPackage:
 
     runtime_files = []
     for entry in sorted(resolved_skill_dir.rglob("*"), key=lambda item: item.relative_to(resolved_skill_dir).as_posix()):
-        relative_name = entry.relative_to(resolved_skill_dir).as_posix()
+        relative_path = entry.relative_to(resolved_skill_dir)
+        relative_name = relative_path.as_posix()
         if entry.is_symlink():
             raise SkillEvalError(f"skill package contains a symlink: {relative_name}")
+        if ".git" in relative_path.parts:
+            raise SkillEvalError(f"skill package contains git metadata: {relative_name}")
         if entry.name in {".skill-evals", ".local-ai-lab"}:
             raise SkillEvalError("skill package must not contain private evaluation data")
         if entry.is_dir():
@@ -180,13 +183,15 @@ def stage_cases(
             _initialize_pristine_git_repository(workspace_dir)
             _install_runtime_skill(validated_package, workspace_dir, contract.skill_name)
 
-            canaries = MappingProxyType(_new_canaries())
+            canaries = MappingProxyType(_new_canaries(row_name))
+            canary_controls = _materialize_canary_controls(codex_home, canaries)
             verifier_path = _new_child_file(verifier_root, f"{row_name}.json", "verifier configuration")
             verifier_path.write_text(
                 json.dumps(
                     {
                         "baseline_hashes": dict(baseline_hashes),
                         "canaries": dict(canaries),
+                        "canary_controls": canary_controls,
                         "case_id": case.case_id,
                         "package_digest": validated_package.digest,
                         "repetition": repetition,
@@ -304,8 +309,8 @@ def _validated_fixture_for_staging(fixture: Path, eval_dir: Path) -> Path:
 def _copy_fixture(source: Path, destination: Path) -> None:
     for entry in sorted(source.rglob("*"), key=lambda item: item.relative_to(source).as_posix()):
         relative = entry.relative_to(source)
-        if relative.parts[0] == ".git":
-            continue
+        if ".git" in relative.parts:
+            raise SkillEvalError(f"fixture contains git metadata: {relative}")
         target = destination / relative
         _require_child_path(target, destination, "fixture entry")
         if entry.is_symlink():
@@ -374,12 +379,44 @@ def _install_runtime_skill(package: SkillPackage, workspace_dir: Path, skill_nam
             raise SkillEvalError(f"runtime skill copy is not a regular file: {relative}")
 
 
-def _new_canaries() -> dict[str, str]:
+def _new_canaries(row_name: str) -> dict[str, str]:
+    row_receipt = hashlib.sha256(row_name.encode("utf-8")).hexdigest()
     return {
-        "environment": f"skill-eval-env-{secrets.token_urlsafe(24)}",
-        "file": f"skill-eval-file-{secrets.token_urlsafe(24)}",
-        "terminal": f"skill-eval-terminal-{secrets.token_urlsafe(24)}",
-        "network": f"https://{secrets.token_urlsafe(24)}.invalid",
+        "environment": f"skill-eval-env-{row_receipt}-{secrets.token_urlsafe(24)}",
+        "file": f"skill-eval-file-{row_receipt}-{secrets.token_urlsafe(24)}",
+        "terminal": f"skill-eval-terminal-{row_receipt}-{secrets.token_urlsafe(24)}",
+        "network": f"https://skill-eval-network-{row_receipt}-{secrets.token_urlsafe(24)}.invalid",
+    }
+
+
+def _materialize_canary_controls(codex_home: Path, canaries: Mapping[str, str]) -> dict[str, Any]:
+    """Create per-row controls that a later candidate invocation can exercise."""
+    controls_dir = codex_home / "skill-eval-controls"
+    _require_child_path(controls_dir, codex_home, "canary controls")
+    controls_dir.mkdir(exist_ok=False)
+
+    environment_path = controls_dir / "environment.json"
+    environment_path.write_text(
+        json.dumps({"SKILL_EVAL_CANARY_RECEIPT": canaries["environment"]}) + "\n",
+        encoding="utf-8",
+    )
+    file_path = controls_dir / "file-receipt.txt"
+    file_path.write_text(canaries["file"], encoding="utf-8")
+    terminal_path = controls_dir / "terminal-receipt"
+    terminal_path.write_text(
+        "#!/bin/sh\nprintf '%s\\n' '" + canaries["terminal"] + "'\n",
+        encoding="utf-8",
+    )
+    terminal_path.chmod(0o700)
+    network_path = controls_dir / "network.json"
+    network_path.write_text(json.dumps({"url": canaries["network"]}) + "\n", encoding="utf-8")
+
+    return {
+        "directory": str(controls_dir),
+        "environment": {"path": str(environment_path), "variable": "SKILL_EVAL_CANARY_RECEIPT"},
+        "file": {"path": str(file_path)},
+        "terminal": {"path": str(terminal_path)},
+        "network": {"path": str(network_path)},
     }
 
 
@@ -456,11 +493,14 @@ def _reject_symlink_components(path: Path, root: Path) -> None:
 
 def _validate_regular_tree(root: Path, label: str) -> None:
     for entry in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+        relative = entry.relative_to(root)
         if entry.is_symlink():
-            raise SkillEvalError(f"{label} contains a symlink: {entry.relative_to(root)}")
+            raise SkillEvalError(f"{label} contains a symlink: {relative}")
+        if ".git" in relative.parts:
+            raise SkillEvalError(f"{label} contains git metadata: {relative}")
         if entry.is_dir() or entry.is_file():
             continue
-        raise SkillEvalError(f"{label} contains a non-regular entry: {entry.relative_to(root)}")
+        raise SkillEvalError(f"{label} contains a non-regular entry: {relative}")
 
 
 def _parse_expected(raw_expected: Any, index: int) -> ExpectedEffects:
