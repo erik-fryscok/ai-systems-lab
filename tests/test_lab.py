@@ -122,6 +122,182 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config["_local_config_path"], str(overlay.resolve()))
 
 
+class InferenceProviderTests(unittest.TestCase):
+    def cloud_config(self):
+        return {
+            "server": {"host": "127.0.0.1", "port": 8080},
+            "providers": {
+                "cloud": {
+                    "type": "openai_compatible",
+                    "base_url": "https://api.example.test/v1",
+                    "api_key_env": "EXAMPLE_AI_API_KEY",
+                }
+            },
+            "models": {
+                "cloud-coder": {
+                    "provider": "cloud",
+                    "provider_model": "vendor/coder-v1",
+                }
+            },
+        }
+
+    def test_cloud_chat_uses_remote_url_and_skips_local_residency(self):
+        response = {
+            "choices": [{"finish_reason": "stop", "message": {"content": "hello"}}],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
+        }
+        with mock.patch.dict(os.environ, {"EXAMPLE_AI_API_KEY": "secret-value"}, clear=False):
+            with mock.patch.object(lab, "json_request", return_value=response) as request:
+                with mock.patch.object(lab, "switch_to_model") as switch:
+                    result = lab.chat_completion(
+                        self.cloud_config(),
+                        "cloud-coder",
+                        {"messages": [{"role": "user", "content": "hello"}]},
+                        64,
+                        0.2,
+                        30,
+                    )
+        switch.assert_not_called()
+        self.assertEqual(result["text"], "hello")
+        self.assertIsNone(result["model_worker_peak_rss_gib"])
+        args, kwargs = request.call_args
+        self.assertEqual(args[1], "https://api.example.test/v1/chat/completions")
+        self.assertEqual(args[2]["model"], "vendor/coder-v1")
+        self.assertEqual(kwargs["headers"], {"Authorization": "Bearer secret-value"})
+
+    def test_local_chat_keeps_switch_and_memory_sampling(self):
+        config = {
+            "server": {"host": "127.0.0.1", "port": 8080},
+            "providers": {"local": {"type": "llama_cpp"}},
+            "models": {"fast": {"provider": "local"}},
+        }
+        response = {
+            "choices": [{"finish_reason": "stop", "message": {"content": "local"}}],
+            "usage": {"completion_tokens": 1},
+        }
+        with mock.patch.object(lab, "switch_to_model") as switch:
+            with mock.patch.object(
+                lab,
+                "run_with_server_memory_sample",
+                return_value=(response, 2.5),
+            ):
+                result = lab.chat_completion(
+                    config,
+                    "fast",
+                    {"messages": [{"role": "user", "content": "hello"}]},
+                    64,
+                    0.2,
+                    30,
+                )
+        switch.assert_called_once_with(config, "fast", timeout=30)
+        self.assertEqual(result["text"], "local")
+        self.assertEqual(result["model_worker_peak_rss_gib"], 2.5)
+
+    def test_cmd_chat_prints_cloud_response_without_switching(self):
+        response = {
+            "choices": [{"finish_reason": "stop", "message": {"content": "cloud answer"}}],
+            "usage": {"completion_tokens": 2},
+        }
+        args = Namespace(
+            selector="cloud-coder",
+            prompt="hello",
+            max_tokens=64,
+            temperature=0.2,
+            timeout=30,
+        )
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, {"EXAMPLE_AI_API_KEY": "secret-value"}, clear=False):
+            with mock.patch.object(lab, "json_request", return_value=response):
+                with mock.patch.object(lab, "switch_to_model") as switch:
+                    with redirect_stdout(output):
+                        lab.cmd_chat(args, self.cloud_config())
+        switch.assert_not_called()
+        self.assertIn("cloud answer", output.getvalue())
+
+    def test_server_benchmark_records_cloud_provider_without_memory_sample(self):
+        response = {
+            "choices": [{"finish_reason": "stop", "message": {"content": "cloud answer"}}],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 2, "total_tokens": 4},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prompt_path = root / "prompts.jsonl"
+            prompt_path.write_text(
+                json.dumps({"name": "smoke", "messages": [{"role": "user", "content": "hello"}]}) + "\n",
+                encoding="utf-8",
+            )
+            config = self.cloud_config()
+            config["paths"] = {"results_dir": str(root / "results")}
+            config["benchmarks"] = {"server_repetitions": 1}
+            config["_config_path"] = str(root / "config.json")
+            args = Namespace(
+                selector="cloud-coder",
+                all_candidates=False,
+                skip_missing=False,
+                prompt_file=str(prompt_path),
+                repetitions=1,
+                max_tokens=64,
+                temperature=0.2,
+                timeout=30,
+                unload_after=False,
+            )
+            with mock.patch.dict(os.environ, {"EXAMPLE_AI_API_KEY": "secret-value"}, clear=False):
+                with mock.patch.object(lab, "json_request", return_value=response):
+                    with mock.patch.object(lab, "write_metadata"):
+                        with redirect_stdout(io.StringIO()):
+                            lab.cmd_bench_server(args, config)
+            result_path = next((root / "results").glob("*-server-cloud-coder/results.jsonl"))
+            row = json.loads(result_path.read_text(encoding="utf-8").splitlines()[0])
+        self.assertEqual(row["provider"], "cloud")
+        self.assertEqual(row["provider_model"], "vendor/coder-v1")
+        self.assertIsNone(row["model_worker_peak_rss_gib"])
+
+    def test_quality_benchmark_runs_cloud_candidate_without_local_residency(self):
+        response = {
+            "choices": [{"finish_reason": "stop", "message": {"content": "cloud answer"}}],
+            "usage": {"completion_tokens": 2},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prompt_path = root / "prompts.jsonl"
+            prompt_path.write_text(
+                json.dumps({"name": "smoke", "messages": [{"role": "user", "content": "hello"}]}) + "\n",
+                encoding="utf-8",
+            )
+            config = self.cloud_config()
+            config["paths"] = {"results_dir": str(root / "results")}
+            config["benchmarks"] = {"quality_repetitions": 1}
+            config["_config_path"] = str(root / "config.json")
+            args = Namespace(
+                selector="cloud-coder",
+                all_candidates=False,
+                skip_missing=False,
+                prompt_file=str(prompt_path),
+                limit_prompts=None,
+                repetitions=1,
+                max_tokens=64,
+                temperature=0.2,
+                timeout=30,
+                unload_after=False,
+                judge_provider="manual",
+                judge_base_url=None,
+                judge_model=None,
+                judge_reasoning_effort=None,
+                judge_timeout=None,
+            )
+            with mock.patch.dict(os.environ, {"EXAMPLE_AI_API_KEY": "secret-value"}, clear=False):
+                with mock.patch.object(lab, "json_request", return_value=response):
+                    with mock.patch.object(lab, "switch_to_model") as switch:
+                        with redirect_stdout(io.StringIO()):
+                            lab.cmd_bench_quality(args, config)
+            switch.assert_not_called()
+            result_path = next((root / "results").glob("*-quality-cloud-coder/results.jsonl"))
+            row = json.loads(result_path.read_text(encoding="utf-8").splitlines()[0])
+        self.assertEqual(row["provider"], "cloud")
+        self.assertEqual(row["provider_model"], "vendor/coder-v1")
+        self.assertIsNone(row["model_worker_peak_rss_gib"])
+
+
 class SkillEvalCommandTests(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
