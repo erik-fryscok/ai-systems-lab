@@ -40,6 +40,7 @@ if str(REPO_ROOT) not in sys.path:
 from ai_systems_lab.providers import (
     ProviderConfigError,
     chat_completions_request,
+    responses_json_request,
     resolve_model_target,
     validate_provider_config,
 )
@@ -2798,12 +2799,45 @@ def response_output_text(response):
 
 def judge_config(cfg, args):
     judge = cfg.get("benchmarks", {}).get("judge", {})
+    provider = args.judge_provider or judge.get("provider", "manual")
+    legacy_providers = {
+        "local": "local-llama",
+        "openai": "cloud-openai-compatible",
+    }
+    if provider in legacy_providers:
+        replacement = legacy_providers[provider]
+        print(
+            f"--judge-provider {provider} is deprecated; use {replacement}.",
+            file=sys.stderr,
+        )
+        provider = replacement
+    if provider == "manual":
+        return {
+            "provider": "manual",
+            "model": None,
+            "reasoning_effort": args.judge_reasoning_effort or judge.get("reasoning_effort", "low"),
+            "timeout_seconds": args.judge_timeout or judge.get("timeout_seconds", 120),
+        }
+    if provider not in cfg.get("providers", {}):
+        raise LabError(f"Unknown judge provider '{provider}'.")
+    model_id = args.judge_model or judge.get("model")
+    if not model_id:
+        raise LabError(f"--judge-model is required when --judge-provider {provider}.")
+    model_id = resolve_selector(cfg, model_id)
+    try:
+        target = model_target(cfg, model_id)
+    except ProviderConfigError as exc:
+        raise LabError(str(exc)) from exc
+    if target.provider != provider:
+        raise LabError(
+            f"Judge model '{model_id}' does not belong to judge provider '{provider}'."
+        )
     return {
-        "provider": args.judge_provider or judge.get("provider", "manual"),
-        "base_url": (args.judge_base_url or judge.get("base_url", "https://api.openai.com/v1")).rstrip("/"),
-        "model": args.judge_model or judge.get("model"),
+        "provider": provider,
+        "model": model_id,
         "reasoning_effort": args.judge_reasoning_effort or judge.get("reasoning_effort", "low"),
         "timeout_seconds": args.judge_timeout or judge.get("timeout_seconds", 120),
+        "target": target,
     }
 
 
@@ -2819,52 +2853,30 @@ def validate_quality_score(score):
             raise LabError(f"Judge returned invalid {key} list.")
 
 
-def require_openai_key():
-    key = os.environ.get("OPENAI_API_KEY")
-    if not key:
-        raise LabError("OPENAI_API_KEY is required for the OpenAI quality judge.")
-    return key
-
-
-def openai_score_response(judge_cfg, eval_payload):
-    if judge_cfg["provider"] != "openai":
-        raise LabError(f"Unsupported judge provider: {judge_cfg['provider']}")
-    if not judge_cfg.get("model"):
-        raise LabError("--judge-model is required when --judge-provider openai.")
-    api_key = require_openai_key()
-    payload = {
-        "model": judge_cfg["model"],
-        "instructions": JUDGE_INSTRUCTIONS,
-        "input": json.dumps(eval_payload, ensure_ascii=False, indent=2),
-        "store": False,
-        "text": {
-            "verbosity": "low",
-            "format": {
-                "type": "json_schema",
-                "name": "quality_score",
-                "strict": True,
-                "schema": QUALITY_SCORE_SCHEMA,
-            },
-        },
-    }
-    if judge_cfg.get("reasoning_effort"):
-        payload["reasoning"] = {"effort": judge_cfg["reasoning_effort"]}
+def openai_score_response(target, judge_cfg, eval_payload):
+    url, payload, headers = responses_json_request(
+        target,
+        JUDGE_INSTRUCTIONS,
+        json.dumps(eval_payload, ensure_ascii=False, indent=2),
+        QUALITY_SCORE_SCHEMA,
+        judge_cfg.get("reasoning_effort"),
+    )
     started = time.perf_counter()
     response = json_request(
         "POST",
-        f"{judge_cfg['base_url']}/responses",
+        url,
         payload,
         timeout=judge_cfg["timeout_seconds"],
-        headers={"Authorization": f"Bearer {api_key}"},
+        headers=headers,
     )
     latency = time.perf_counter() - started
     raw_text = response_output_text(response)
     if not raw_text:
-        raise LabError("OpenAI judge returned no output text.")
+        raise LabError("Remote judge returned no output text.")
     try:
         score = json.loads(raw_text)
     except json.JSONDecodeError as exc:
-        raise LabError(f"OpenAI judge returned invalid JSON: {raw_text}") from exc
+        raise LabError(f"Remote judge returned invalid JSON: {raw_text}") from exc
     validate_quality_score(score)
     return {
         "score": score,
@@ -2897,11 +2909,6 @@ def extract_json_object(text):
 
 def local_score_response(cfg, judge_cfg, eval_payload):
     model_id = judge_cfg.get("model")
-    if not model_id:
-        raise LabError("--judge-model is required when --judge-provider local.")
-    model_id = resolve_selector(cfg, model_id)
-    require_local_model(cfg, model_id, "local judge")
-    switch_to_model(cfg, model_id, timeout=judge_cfg["timeout_seconds"])
     prompt = {
         "messages": [
             {"role": "system", "content": JUDGE_INSTRUCTIONS},
@@ -2941,14 +2948,12 @@ def local_score_response(cfg, judge_cfg, eval_payload):
 
 
 def score_quality_response(cfg, judge_cfg, eval_payload):
-    provider = judge_cfg["provider"]
-    if provider == "openai":
-        return openai_score_response(judge_cfg, eval_payload)
-    if provider == "local":
-        return local_score_response(cfg, judge_cfg, eval_payload)
-    if provider == "manual":
+    if judge_cfg["provider"] == "manual":
         return {}
-    raise LabError(f"Unsupported judge provider: {provider}")
+    target = judge_cfg["target"]
+    if target.is_local:
+        return local_score_response(cfg, judge_cfg, eval_payload)
+    return openai_score_response(target, judge_cfg, eval_payload)
 
 
 def quality_eval_payload(selector, model_id, prompt, candidate_text):
@@ -3016,16 +3021,10 @@ def cmd_bench_quality(args, cfg):
         raise LabError(f"No chat prompts found in {prompt_path}")
 
     judge_cfg = judge_config(cfg, args)
-    if judge_cfg["provider"] == "openai":
-        require_openai_key()
-    if judge_cfg["provider"] == "local":
-        judge_model = judge_cfg.get("model")
-        if not judge_model:
-            raise LabError("--judge-model is required when --judge-provider local.")
-        judge_model = resolve_selector(cfg, judge_model)
-        require_local_model(cfg, judge_model, "local judge")
-        judge_cfg["model"] = judge_model
-        if judge_model in model_ids:
+    judge_target = judge_cfg.get("target")
+    if judge_target and judge_target.is_local:
+        require_local_model(cfg, judge_cfg["model"], "local judge")
+        if judge_cfg["model"] in model_ids:
             raise LabError("The local judge model must be different from every candidate model.")
     repetitions = args.repetitions or cfg.get("benchmarks", {}).get("quality_repetitions", 1)
     out_dir = paths(cfg)["results_dir"] / f"{now_stamp()}-quality-{args.selector}"
@@ -3035,7 +3034,7 @@ def cmd_bench_quality(args, cfg):
         judge_metadata.update({
             key: value
             for key, value in judge_cfg.items()
-            if key not in {"provider", "api_key"}
+            if key not in {"provider", "api_key", "target"}
         })
     write_metadata(cfg, out_dir, "quality", extra={
         "judge": judge_metadata,
@@ -3141,7 +3140,7 @@ def cmd_bench_quality(args, cfg):
                             flush=True,
                         )
 
-            if judge_cfg["provider"] == "local":
+            if judge_target and judge_target.is_local:
                 if args.unload_after:
                     unload_model(cfg, judge_cfg["model"], quiet=True)
                 elif target.is_local:
@@ -3420,7 +3419,6 @@ def build_parser():
     bench_quality.add_argument("--skip-missing", action="store_true")
     bench_quality.add_argument(
         "--judge-provider",
-        choices=["manual", "local", "openai"],
         default=None,
     )
     bench_quality.add_argument("--judge-base-url", default=None)

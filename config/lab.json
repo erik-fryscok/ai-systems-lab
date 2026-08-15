@@ -49,7 +49,6 @@
     "quality_repetitions": 1,
     "judge": {
       "provider": "manual",
-      "base_url": "https://api.openai.com/v1",
       "model": null,
       "reasoning_effort": "low",
       "timeout_seconds": 120

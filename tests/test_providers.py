@@ -6,6 +6,7 @@ from ai_systems_lab.providers import (
     ProviderConfigError,
     authorization_headers,
     chat_completions_request,
+    responses_json_request,
     resolve_model_target,
     validate_provider_config,
 )
@@ -73,6 +74,30 @@ class ProviderConfigTests(unittest.TestCase):
         self.assertEqual(url, "https://api.example.test/v1/chat/completions")
         self.assertEqual(payload["model"], "vendor/coder-v1")
         self.assertEqual(payload["messages"], [{"role": "user", "content": "hello"}])
+        self.assertEqual(headers, {"Authorization": "Bearer secret-value"})
+
+    def test_responses_request_uses_provider_capability_and_credentials(self):
+        self.config["providers"]["cloud-openai"]["responses_api"] = True
+        target = resolve_model_target(
+            self.config, "cloud-coder", "http://127.0.0.1:8080/v1"
+        )
+        schema = {
+            "type": "object",
+            "properties": {"pass": {"type": "boolean"}},
+            "required": ["pass"],
+            "additionalProperties": False,
+        }
+        with mock.patch.dict(os.environ, {"EXAMPLE_AI_API_KEY": "secret-value"}, clear=False):
+            url, payload, headers = responses_json_request(
+                target,
+                "Score the response.",
+                "evaluation input",
+                schema,
+                "low",
+            )
+        self.assertEqual(url, "https://api.example.test/v1/responses")
+        self.assertEqual(payload["model"], "vendor/coder-v1")
+        self.assertEqual(payload["text"]["format"]["schema"], schema)
         self.assertEqual(headers, {"Authorization": "Bearer secret-value"})
 
 

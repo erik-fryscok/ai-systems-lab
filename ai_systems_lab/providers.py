@@ -95,3 +95,38 @@ def chat_completions_request(target, messages, max_tokens, temperature):
         payload,
         authorization_headers(target),
     )
+
+
+def responses_json_request(
+    target,
+    instructions,
+    input_value,
+    schema,
+    reasoning_effort,
+):
+    if not target.responses_api:
+        raise ProviderConfigError(
+            f"provider '{target.provider}' does not support the Responses API judge"
+        )
+    payload = {
+        "model": target.model_id,
+        "instructions": instructions,
+        "input": input_value,
+        "store": False,
+        "text": {
+            "verbosity": "low",
+            "format": {
+                "type": "json_schema",
+                "name": "quality_score",
+                "strict": True,
+                "schema": schema,
+            },
+        },
+    }
+    if reasoning_effort:
+        payload["reasoning"] = {"effort": reasoning_effort}
+    return (
+        f"{target.base_url}/responses",
+        payload,
+        authorization_headers(target),
+    )
