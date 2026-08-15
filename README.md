@@ -322,6 +322,20 @@ optional: `~/Models/local-ai-lab` remains readable while the new model directory
 does not exist. Use this safe order when you want to move the weights and
 replace the old service:
 
+Before moving weights, confirm that the new destination is absent:
+
+```sh
+test ! -e "$HOME/Models/ai-systems-lab"
+```
+
+Only run the `mv` command when `~/Models/ai-systems-lab` does not exist. If it
+already exists, do not move the legacy directory automatically. Leave the
+legacy directory untouched and either keep the new destination absent so the
+runtime continues its legacy fallback/read, or manually merge verified model
+directories with a backup-preserving process. The fallback is disabled whenever
+the new model directory exists, so an automatic move would nest the legacy
+directory and make its weights unavailable to the configured path.
+
 ```sh
 ./scripts/lab service-uninstall-legacy
 mv "$HOME/Models/local-ai-lab" "$HOME/Models/ai-systems-lab"

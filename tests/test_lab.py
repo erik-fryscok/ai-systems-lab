@@ -65,6 +65,25 @@ class IdentityMigrationTests(unittest.TestCase):
             }
             self.assertEqual(lab.paths(config)["models_dir"], legacy.resolve())
 
+    def test_readme_migration_requires_an_absent_new_models_directory(self):
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn(
+            "Only run the `mv` command when `~/Models/ai-systems-lab` does not exist.",
+            readme,
+        )
+        self.assertIn(
+            "already exists, do not move the legacy directory automatically.",
+            readme,
+        )
+        self.assertIn(
+            "runtime continues its legacy fallback/read",
+            readme,
+        )
+        self.assertIn(
+            "manually merge verified model\ndirectories",
+            readme,
+        )
+
     def test_pull_writes_to_new_models_directory_when_reads_fall_back_to_legacy(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
