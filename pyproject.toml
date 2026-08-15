@@ -1,7 +1,7 @@
 [project]
-name = "local-ai-lab"
+name = "ai-systems-lab"
 version = "0.1.0"
-description = "Local AI lab for llama.cpp model routing, workload aliases, benchmarking, and evaluation through one OpenAI-compatible gateway."
+description = "Experimental lab for model providers, routing, compatibility, benchmarking, and evaluation across local and cloud AI systems."
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = ["PyYAML==6.0.2"]
@@ -10,8 +10,9 @@ authors = [
   { name = "Erik Fryscok" },
 ]
 keywords = [
-  "local-ai",
-  "local-llm",
+  "ai-systems",
+  "model-providers",
+  "openai-compatible",
   "llama.cpp",
   "model-routing",
   "llm-evaluation",
@@ -22,6 +23,6 @@ classifiers = [
 ]
 
 [project.urls]
-Repository = "https://github.com/erik-fryscok/local-ai-lab"
-Documentation = "https://github.com/erik-fryscok/local-ai-lab#readme"
-Issues = "https://github.com/erik-fryscok/local-ai-lab/issues"
+Repository = "https://github.com/erik-fryscok/ai-systems-lab"
+Documentation = "https://github.com/erik-fryscok/ai-systems-lab#readme"
+Issues = "https://github.com/erik-fryscok/ai-systems-lab/issues"

@@ -1,6 +1,6 @@
 # Agent Client Configuration
 
-All clients target:
+Local clients target the local gateway:
 
 ```text
 http://127.0.0.1:8080/v1
@@ -9,7 +9,7 @@ http://127.0.0.1:8080/v1
 Compatibility evidence recorded on 2026-07-24 used llama.cpp build `b10090`,
 Cline CLI `3.0.46`, OpenCode `1.18.4`, and Qwen Code `0.19.6`.
 
-`local-ai-lab` is a persistent JIT gateway. Select the catalog alias in the
+`AI Systems Lab` provides a persistent local JIT gateway. Select the catalog alias in the
 agent configuration; the gateway validates files, serializes any necessary
 unload/load transition, waits for readiness, and forwards the original request.
 It keeps one generation model resident for later requests and unloads it after
@@ -35,6 +35,34 @@ the active Cline aliases); the gateway renders the same value into llama.cpp.
 Large aliases such as `gpt-oss-120b` may take tens of seconds for their first
 request. Keep the client request timeout generous; the gateway uses a 15-minute
 load timeout and a 30-minute forwarded-request timeout by default.
+
+## Cloud Providers
+
+Cloud-hosted OpenAI-compatible providers are selected from the lab through a
+model alias such as `cloud-example`. Add the provider and alias in an ignored
+local overlay, then select that alias with the provider-agnostic commands; the
+lab resolves it to the provider's base URL and model ID without routing through
+the local gateway.
+
+```sh
+./scripts/lab chat cloud-example "Compare these designs."
+./scripts/lab bench-server cloud-example --prompt-file benchmarks/prompts/coder.jsonl
+```
+
+An application client that bypasses the lab uses the cloud provider's actual
+model ID and an opt-in API key environment variable:
+
+```js
+const cloud = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+  baseURL: "https://api.openai.com/v1",
+});
+
+await cloud.chat.completions.create({
+  model: "gpt-5.5",
+  messages: [{ role: "user", content: "Compare these designs." }],
+});
+```
 
 ## Benchmark Mode
 

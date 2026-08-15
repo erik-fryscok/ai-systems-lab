@@ -1,10 +1,17 @@
-# local-ai-lab
+# AI Systems Lab
 
-Local llama.cpp lab for running one persistent gateway endpoint with
-workload-specific model aliases, repeatable Hugging Face pulls, and benchmark
-output you can compare over time. Cline sends an alias in each request; the
-gateway JIT-loads it, evicts the previous generation model, then forwards the
-original request.
+AI Systems Lab is an experimental learning and evaluation testbed, not
+production infrastructure. Local llama.cpp remains a first-class backend and
+the default workflow, while cloud-hosted OpenAI-compatible providers can
+participate in the same chat and evaluation paths. Workload aliases choose
+models, and each model resolves through a provider boundary. Provider
+credentials are opt-in environment variables and are never stored in committed
+configuration.
+
+The local default runs one persistent llama.cpp gateway with workload-specific
+model aliases, repeatable Hugging Face pulls, and benchmark output you can
+compare over time. The gateway JIT-loads a local alias, evicts the previous
+generation model, then forwards the original request.
 
 The default setup is:
 
@@ -74,9 +81,9 @@ Switch workloads:
 ./scripts/lab switch fast
 ```
 
-`switch`, `load`, `chat`, and server benchmarks enforce the residency policy:
-keep at most one non-embedding model loaded, while allowing embedding models to
-stay loaded alongside it.
+For local aliases, `switch` and `load` enforce the residency policy: keep at
+most one non-embedding model loaded, while allowing embedding models to stay
+loaded alongside it.
 
 Stop the router:
 
@@ -113,13 +120,34 @@ await client.chat.completions.create({
 Embedding models are exempt from the single non-embedding model rule and can
 remain loaded alongside the active chat/reasoning/coding model.
 
+## Provider Model
+
+The committed catalog keeps the local `local-llama` provider as the default.
+To add the opt-in cloud example without committing a credential, create the
+ignored local overlay and supply its environment variable only in your shell:
+
+```sh
+cp config/lab.cloud.example.json config/lab.local.json
+read -r -s OPENAI_API_KEY
+export OPENAI_API_KEY
+./scripts/lab chat cloud-example "Compare local and hosted inference tradeoffs."
+./scripts/lab bench-server cloud-example --prompt-file benchmarks/prompts/coder.jsonl
+```
+
+`pull`, `presets`, `start`, `load`, `switch`, `unload`, `verify`, and
+`bench-llama` are local llama.cpp lifecycle commands. `catalog`, `chat`,
+`bench-server`, and candidate `bench-quality` are provider-agnostic: they
+resolve the selected alias through its configured provider. Keep credentials in
+opt-in environment variables; do not add them to `config/lab.json` or a
+committed overlay.
+
 ## Configuration
 
 Edit [config/lab.json](config/lab.json).
 
 Important sections:
 
-- `paths.models_dir`: common GGUF directory. Defaults to `~/Models/local-ai-lab`.
+- `paths.models_dir`: common GGUF directory. Defaults to `~/Models/ai-systems-lab`.
 - `server`: router host, port, `models_max`, autoload, metrics, and extra args.
 - `preset_defaults`: llama.cpp args applied to every model preset.
 - `use_cases`: workload names, defaults, candidate models, and prompt files.
@@ -170,7 +198,7 @@ Add a local fine-tuned GGUF by using a direct path:
 ```json
 "coder-my-ft": {
   "description": "My fine-tuned coding model.",
-  "path": "~/Models/local-ai-lab/my-ft/model.gguf",
+  "path": "~/Models/ai-systems-lab/my-ft/model.gguf",
   "preset": {
     "ctx-size": 16384,
     "load-on-startup": false
@@ -272,7 +300,7 @@ make service-status
 The LaunchAgent is installed at:
 
 ```text
-~/Library/LaunchAgents/com.erik.local-ai-lab.plist
+~/Library/LaunchAgents/com.erik.ai-systems-lab.plist
 ```
 
 Service controls:
@@ -286,6 +314,22 @@ make service-uninstall
 
 Once installed, the normal `make start`, `make stop`, and `make status` commands
 use the LaunchAgent. Logs remain available through `make logs`.
+
+## Migration from Local AI Lab
+
+The runtime keeps explicit legacy read fallbacks, so moving existing weights is
+optional: `~/Models/local-ai-lab` remains readable while the new model directory
+does not exist. Use this safe order when you want to move the weights and
+replace the old service:
+
+```sh
+./scripts/lab service-uninstall-legacy
+mv "$HOME/Models/local-ai-lab" "$HOME/Models/ai-systems-lab"
+make service-install
+```
+
+The migration command removes only the legacy LaunchAgent registration and
+plist. It never deletes model weights, state, or credentials.
 
 The default coding model starts hot and remains loaded. Enable automatic idle
 sleep to release the model and KV-cache memory after 15 minutes without a task:
@@ -308,7 +352,7 @@ This is useful before switching to battery power:
 The active preferences live outside the repository at:
 
 ```text
-~/Library/Application Support/com.erik.local-ai-lab/state.json
+~/Library/Application Support/com.erik.ai-systems-lab/state.json
 ```
 
 Status is available for terminals, Raycast, or automation:
@@ -338,7 +382,7 @@ supports the same flags. Results are written under:
 benchmarks/results/<timestamp>-llama-bench-<selector>/
 ```
 
-End-to-end router benchmark through `/v1/chat/completions`:
+End-to-end chat benchmark through `/v1/chat/completions`:
 
 ```sh
 make start
@@ -357,7 +401,9 @@ under `benchmarks/results/`.
 Use both benchmark modes:
 
 - `bench-llama` isolates model/runtime throughput for prompt and generation token rates.
-- `bench-server` measures the workload path your apps use, including router load behavior and request latency.
+- `bench-server` measures the workload path your apps use, including local router
+  load behavior when the selected alias is local, and request latency for every
+  provider.
 
 Quality and correctness benchmark with manual review by default:
 
@@ -367,9 +413,10 @@ Quality and correctness benchmark with manual review by default:
 ./scripts/lab bench-quality fast --all-candidates
 ```
 
-`bench-quality` runs the same local router path, saves each model answer, and
-creates `manual-review.json`. This keeps paid inference out of the baseline and
-keeps automated acceptance criteria plus blind human review above model judging.
+`bench-quality` runs the selected alias through its provider, saves each model
+answer, and creates `manual-review.json`. This keeps paid inference out of the
+baseline and keeps automated acceptance criteria plus blind human review above
+model judging.
 The default 4096-token output budget leaves room for reasoning-capable models
 to produce a visible answer; an empty visible completion is recorded as a
 failed result rather than sent for review.
@@ -405,7 +452,7 @@ Quality results are written under:
 benchmarks/results/<timestamp>-quality-<selector>/
 ```
 
-Each raw result row includes the local model answer and performance data.
+Each raw result row includes the candidate model answer and performance data.
 Manual runs create a review template for correctness, completeness, instruction
 following, clarity, an overall 1-5 score, pass/fail, and rationale. Local or
 OpenAI judge runs populate those fields automatically as secondary evidence.

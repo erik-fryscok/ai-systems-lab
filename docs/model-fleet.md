@@ -1,8 +1,9 @@
 # Local Model Fleet
 
-The fleet provides role-oriented local inference for real software work on one
-128 GB Apple Silicon Mac. llama.cpp is the comparable primary runtime and the
-router remains bound to `127.0.0.1`.
+This is the `local-llama` provider's fleet policy. It provides role-oriented
+local inference for real software work on one 128 GB Apple Silicon Mac.
+llama.cpp is the comparable primary runtime and the router remains bound to
+`127.0.0.1`.
 
 The current catalog is the source of truth:
 

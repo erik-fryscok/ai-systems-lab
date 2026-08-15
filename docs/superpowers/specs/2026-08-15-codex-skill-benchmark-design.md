@@ -70,7 +70,7 @@ types, duplicate IDs, or package entries stop before a candidate model runs.
 ### Isolated execution
 
 Every case/repetition receives a new Git-initialized workspace beneath
-`.local-ai-lab/skill-evals/<run-id>/workspaces/`, copied without following
+`.ai-systems-lab/skill-evals/<run-id>/workspaces/`, copied without following
 symlinks. Only runtime skill files are installed into
 `.agents/skills/<skill-name>/`; `.skill-evals` is never installed. Each row has
 its own `CODEX_HOME`, synthetic environment/file/terminal/network canaries, and
