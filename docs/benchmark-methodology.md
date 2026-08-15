@@ -69,7 +69,8 @@ observed resident set size (`peak_model_worker_rss_gib`). It excludes unrelated
 processes and should not be interpreted as total system energy use or a complete
 breakdown of Apple unified memory.
 
-Raw results remain in this private repository. Export only sanitized summaries:
+Raw results remain locally ignored under `benchmarks/results/`. Export and
+publish only reviewed, sanitized summaries:
 
 ```sh
 ./scripts/lab export-public RESULT_DIR --output FILE
