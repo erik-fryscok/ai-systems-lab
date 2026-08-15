@@ -33,6 +33,17 @@ class IdentityMigrationTests(unittest.TestCase):
         ):
             self.assertEqual(lab.project_env("CONFIG"), "/new/config.json")
 
+    def test_empty_new_environment_value_still_wins_over_legacy_value(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "AI_SYSTEMS_LAB_CONFIG": "",
+                "LOCAL_AI_LAB_CONFIG": "/legacy/config.json",
+            },
+            clear=True,
+        ):
+            self.assertEqual(lab.project_env("CONFIG"), "")
+
     def test_legacy_environment_name_remains_a_read_fallback(self):
         with mock.patch.dict(
             os.environ,
@@ -53,6 +64,40 @@ class IdentityMigrationTests(unittest.TestCase):
                 }
             }
             self.assertEqual(lab.paths(config)["models_dir"], legacy.resolve())
+
+    def test_pull_writes_to_new_models_directory_when_reads_fall_back_to_legacy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            new_models = root / "ai-systems-lab"
+            legacy_models = root / "local-ai-lab"
+            legacy_models.mkdir()
+            config = {
+                "providers": {"local": {"type": "llama_cpp"}},
+                "paths": {
+                    "models_dir": str(new_models),
+                    "legacy_models_dir": str(legacy_models),
+                },
+                "models": {
+                    "model": {
+                        "provider": "local",
+                        "repo_id": "example/model",
+                        "files": ["model.gguf"],
+                        "local_dir": "model",
+                    }
+                },
+            }
+
+            def download(command, check):
+                target = Path(command[command.index("--local-dir") + 1])
+                (target / "model.gguf").touch()
+
+            with mock.patch.object(lab, "hf_binary", return_value="/test/hf"), mock.patch.object(
+                lab.subprocess, "run", side_effect=download
+            ):
+                lab.pull_one(config, "model")
+
+            self.assertTrue((new_models / "model" / "model.gguf").exists())
+            self.assertFalse((legacy_models / "model").exists())
 
     def test_new_service_identity_is_used_for_writes(self):
         self.assertEqual(lab.SERVICE_LABEL, "com.erik.ai-systems-lab")
@@ -98,6 +143,28 @@ class IdentityMigrationTests(unittest.TestCase):
                 lab.save_service_state(lab.load_service_state())
             self.assertTrue(new_path.exists())
             self.assertTrue(legacy_path.exists())
+
+    def test_legacy_state_environment_path_is_read_only_and_save_migrates_to_new_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            new_path = root / "new" / "state.json"
+            legacy_path = root / "legacy" / "state.json"
+            legacy_path.parent.mkdir()
+            legacy_text = json.dumps({"auto_idle_seconds": 120})
+            legacy_path.write_text(legacy_text, encoding="utf-8")
+            with mock.patch.dict(
+                os.environ,
+                {"LOCAL_AI_LAB_STATE_PATH": str(legacy_path)},
+                clear=True,
+            ), mock.patch.object(lab, "SERVICE_STATE_PATH", new_path):
+                state = lab.load_service_state()
+                state["auto_idle_seconds"] = 121
+                lab.save_service_state(state)
+
+            self.assertEqual(legacy_path.read_text(encoding="utf-8"), legacy_text)
+            self.assertEqual(
+                json.loads(new_path.read_text(encoding="utf-8"))["auto_idle_seconds"], 121
+            )
 
     def test_service_install_rejects_legacy_plist_before_stopping_anything(self):
         legacy_path = mock.Mock()
@@ -1343,7 +1410,7 @@ class BenchmarkModelSessionTests(unittest.TestCase):
     def test_benchmark_session_allows_gateway_to_reload_the_previous_pin(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
             os.environ,
-            {"LOCAL_AI_LAB_STATE_PATH": str(Path(directory) / "state.json")},
+            {"AI_SYSTEMS_LAB_STATE_PATH": str(Path(directory) / "state.json")},
             clear=False,
         ):
             models_dir = Path(directory) / "models"
@@ -1395,7 +1462,7 @@ class BenchmarkModelSessionTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
             os.environ,
-            {"LOCAL_AI_LAB_STATE_PATH": str(Path(directory) / "state.json")},
+            {"AI_SYSTEMS_LAB_STATE_PATH": str(Path(directory) / "state.json")},
             clear=False,
         ):
             models_dir = Path(directory) / "models"
@@ -1467,7 +1534,7 @@ class GatewayTests(unittest.TestCase):
 
     def test_gateway_rejects_automatic_switch_while_benchmark_is_pinned(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
-            os.environ, {"LOCAL_AI_LAB_STATE_PATH": str(Path(directory) / "state.json")}, clear=False
+            os.environ, {"AI_SYSTEMS_LAB_STATE_PATH": str(Path(directory) / "state.json")}, clear=False
         ):
             model_dir = Path(directory) / "fast"
             model_dir.mkdir()

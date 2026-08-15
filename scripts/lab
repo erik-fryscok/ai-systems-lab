@@ -115,9 +115,10 @@ def deep_merge(base, overlay):
 
 
 def project_env(suffix):
-    return os.environ.get(f"AI_SYSTEMS_LAB_{suffix}") or os.environ.get(
-        f"LOCAL_AI_LAB_{suffix}"
-    )
+    name = f"AI_SYSTEMS_LAB_{suffix}"
+    if name in os.environ:
+        return os.environ[name]
+    return os.environ.get(f"LOCAL_AI_LAB_{suffix}")
 
 
 def load_config(path):
@@ -140,16 +141,23 @@ def load_config(path):
 
 
 def service_state_path():
-    override = project_env("STATE_PATH")
+    override = os.environ.get("AI_SYSTEMS_LAB_STATE_PATH")
     return Path(override).expanduser().resolve() if override else SERVICE_STATE_PATH
+
+
+def legacy_service_state_path():
+    override = os.environ.get("LOCAL_AI_LAB_STATE_PATH")
+    return Path(override).expanduser().resolve() if override else LEGACY_SERVICE_STATE_PATH
 
 
 def load_service_state():
     state = dict(DEFAULT_SERVICE_STATE)
     path = service_state_path()
     read_path = path
-    if path == SERVICE_STATE_PATH and not path.exists() and LEGACY_SERVICE_STATE_PATH.exists():
-        read_path = LEGACY_SERVICE_STATE_PATH
+    if not path.exists():
+        legacy_path = legacy_service_state_path()
+        if legacy_path.exists():
+            read_path = legacy_path
     if read_path.exists():
         try:
             stored = json.loads(read_path.read_text(encoding="utf-8"))
@@ -220,7 +228,7 @@ def repo_path(value):
 
 def paths(cfg):
     raw = cfg.get("paths", {})
-    models_dir = repo_path(raw.get("models_dir", "~/Models/ai-systems-lab"))
+    models_dir = configured_models_dir(cfg)
     legacy_models_dir = raw.get("legacy_models_dir")
     if not models_dir.exists() and legacy_models_dir:
         legacy_path = repo_path(legacy_models_dir)
@@ -239,6 +247,10 @@ def paths(cfg):
         "generated_dir": repo_path(raw.get("generated_dir", "config/generated")),
         "results_dir": repo_path(raw.get("results_dir", "benchmarks/results")),
     }
+
+
+def configured_models_dir(cfg):
+    return repo_path(cfg.get("paths", {}).get("models_dir", "~/Models/ai-systems-lab"))
 
 
 def expand_value(value, cfg):
@@ -335,6 +347,12 @@ def model_local_dir(cfg, model_id):
     entry = model_entry(cfg, model_id)
     local_dir = entry.get("local_dir", model_id)
     return paths(cfg)["models_dir"] / local_dir
+
+
+def model_write_local_dir(cfg, model_id):
+    entry = model_entry(cfg, model_id)
+    local_dir = entry.get("local_dir", model_id)
+    return configured_models_dir(cfg) / local_dir
 
 
 def model_filename(entry):
@@ -870,7 +888,7 @@ def pull_one(cfg, model_id, dry_run=False, force=False):
     if not binary:
         raise LabError("Neither 'hf' nor 'huggingface-cli' is available on PATH.")
 
-    local_dir = model_local_dir(cfg, model_id)
+    local_dir = model_write_local_dir(cfg, model_id)
     local_dir.mkdir(parents=True, exist_ok=True)
 
     command = [binary, "download", entry["repo_id"]]
