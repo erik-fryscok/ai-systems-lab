@@ -1,0 +1,4 @@
+Synthetic validation record
+
+Command: python3 test_number_words.py
+Result: 1 test passed

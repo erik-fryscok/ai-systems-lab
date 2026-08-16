@@ -1,6 +1,8 @@
 import importlib.util
 import hashlib
 import json
+import collections
+import re
 import subprocess
 import tempfile
 import unittest
@@ -17,6 +19,119 @@ SPEC = importlib.util.spec_from_file_location(
 )
 skill_eval = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(skill_eval)
+
+
+PRIVATE_MARKERS = (
+    "REAL-CUSTOMER-RECORD",
+    "PRIVATE-EMPLOYER-SYSTEM",
+    "UNPUBLISHED-PRODUCT-CODENAME",
+)
+
+
+class GithubPublicReadinessFixtureTests(unittest.TestCase):
+    """Keep the committed public-readiness benchmark entirely synthetic."""
+
+    def setUp(self):
+        self.eval_dir = (
+            REPO_ROOT / "benchmarks" / "skills" / "github-public-readiness"
+        )
+        self.skill_dir = (
+            REPO_ROOT.parents[2] / "skills" / "skills" / "github-public-readiness"
+        )
+
+    def test_real_contract_has_the_nine_read_only_authored_cases(self):
+        contract = skill_eval.load_skill_contract(self.skill_dir, self.eval_dir)
+
+        self.assertEqual(
+            {case.case_id for case in contract.cases},
+            {
+                "direct-publish-now",
+                "direct-light-cleanup",
+                "direct-keep-private",
+                "implicit-visibility-decision",
+                "implicit-portfolio-decision",
+                "implicit-release-sequence",
+                "negative-code-explanation",
+                "negative-test-diagnosis",
+                "negative-readme-summary",
+            },
+        )
+        self.assertEqual(len(contract.cases), 9)
+        self.assertEqual({case.sandbox for case in contract.cases}, {"read-only"})
+        self.assertEqual(
+            collections.Counter(case.category for case in contract.cases),
+            {
+                "direct_activation": 3,
+                "implicit_activation": 3,
+                "negative_activation": 3,
+            },
+        )
+        for case in contract.cases:
+            self.assertTrue(case.fixture.is_relative_to(self.eval_dir))
+
+    def test_real_contract_redacts_private_markers_and_negative_audit_labels(self):
+        contract = skill_eval.load_skill_contract(self.skill_dir, self.eval_dir)
+        cases = {case.case_id: case for case in contract.cases}
+
+        for case_id in {"direct-keep-private", "implicit-release-sequence"}:
+            assertions = {
+                frozenset(assertion.items()) for assertion in cases[case_id].expected.output
+            }
+            self.assertIn(
+                frozenset({"type": "not-contains", "value": "SYNTHETIC-NONPUBLIC-DESIGN-BOUNDARY"}.items()),
+                assertions,
+            )
+            self.assertIn(
+                frozenset({"type": "not-contains", "value": "SYNTHETIC-CUSTOMER-BOUNDARY"}.items()),
+                assertions,
+            )
+
+        for case_id in {
+            "negative-code-explanation",
+            "negative-test-diagnosis",
+            "negative-readme-summary",
+        }:
+            assertions = {frozenset(assertion.items()) for assertion in cases[case_id].expected.output}
+            self.assertIn(
+                frozenset({"type": "not-contains", "value": "Public readiness:"}.items()),
+                assertions,
+            )
+            self.assertIn(
+                frozenset({"type": "not-contains", "value": "Portfolio value:"}.items()),
+                assertions,
+            )
+
+    def test_committed_benchmark_content_has_no_private_or_unsafe_artifacts(self):
+        credential_pattern = re.compile(
+            r"(?:gh[pousr]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{12,}|"
+            r"(?:api[_-]?key|secret|password)\s*[:=])",
+            re.IGNORECASE,
+        )
+        email_pattern = re.compile(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b")
+        hostname_pattern = re.compile(r"\b(?:[a-z0-9-]+\.)+[a-z]{2,}\b", re.IGNORECASE)
+
+        for path in self.eval_dir.rglob("*"):
+            relative_path = path.relative_to(self.eval_dir)
+            self.assertFalse(path.is_symlink(), f"symlink in benchmark: {relative_path}")
+            self.assertNotIn(".git", relative_path.parts)
+            if path.is_dir():
+                continue
+
+            self.assertTrue(path.is_file(), f"non-regular benchmark entry: {relative_path}")
+            contents = path.read_text(encoding="utf-8")
+            self.assertIsNone(credential_pattern.search(contents), relative_path)
+            self.assertIsNone(email_pattern.search(contents), relative_path)
+            self.assertNotRegex(contents, r"/(?:Users|home)/[^\s]+")
+            self.assertNotIn("~/", contents)
+            for hostname in hostname_pattern.findall(contents):
+                self.assertTrue(
+                    hostname in {"example.test", "example.invalid"}
+                    or hostname.endswith(".example.test")
+                    or hostname.endswith(".example.invalid"),
+                    f"non-reserved hostname {hostname!r} in {relative_path}",
+                )
+            for marker in PRIVATE_MARKERS:
+                self.assertNotIn(marker, contents, relative_path)
 
 
 VALID_CASES = """\
