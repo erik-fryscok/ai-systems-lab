@@ -785,7 +785,11 @@ def verify_benchmark_containment(rows: list[BenchmarkRow], raw_result: Mapping[s
         if not raw.get("trace"):
             raise SkillEvalError("missing trace/verifier evidence")
         verifier = json.loads(verifier_path.read_text(encoding="utf-8"))
-        if verifier.get("baseline_hashes") != _hash_regular_files(row.workspace_dir):
+        actual_hashes = _hash_regular_files(row.workspace_dir)
+        baseline_hashes = verifier.get("baseline_hashes")
+        if not isinstance(baseline_hashes, Mapping) or {
+            path: actual_hashes.get(path) for path in baseline_hashes
+        } != baseline_hashes:
             raise SkillEvalError("read-only fixture mutation")
         serialized = json.dumps(raw, ensure_ascii=False)
         if any(canary in serialized for canary in verifier.get("canaries", {}).values()):

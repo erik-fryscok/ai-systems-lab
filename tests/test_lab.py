@@ -1842,6 +1842,12 @@ class GatewayTests(unittest.TestCase):
 
 
 class PublicExportTests(unittest.TestCase):
+    def test_loaded_public_schema_rejects_invalid_nested_metric(self):
+        schema = json.loads((REPO_ROOT / "docs" / "benchmark-results" / "github-public-readiness-benchmark.schema.json").read_text())
+        payload = {"metrics": {"control": {"task_pass_rate": "not-a-number"}}}
+        with self.assertRaisesRegex(lab.LabError, "violates its schema"):
+            lab._validate_json_schema(payload, {"type": "object", "properties": {"metrics": {"$ref": "#/$defs/metrics"}}}, schema)
+
     def test_sanitize_public_value_drops_answers_and_local_metadata(self):
         source = {
             "repo": "/Users/example/private",
