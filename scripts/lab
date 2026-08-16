@@ -2284,6 +2284,10 @@ def cmd_skill_redteam(args, cfg):
 
 def cmd_skill_benchmark(args, cfg):
     try:
+        if args.target != "openai:gpt-5.6-terra":
+            raise LabError("skill-benchmark requires candidate openai:gpt-5.6-terra")
+        if args.judge_model != "gpt-5.6":
+            raise LabError("skill-benchmark requires judge gpt-5.6")
         target = skill_eval.parse_target(args.target, cfg)
         skill_eval.validate_judge(target, args.judge_model)
         dependencies = require_skill_eval_dependencies()
@@ -2323,6 +2327,7 @@ def cmd_skill_benchmark(args, cfg):
             run_root,
             keep_workspaces_on_error=args.keep_workspaces,
         )
+        skill_eval.validate_benchmark_matrix(rows, args.profile)
         config_path = run_root / "promptfooconfig.yaml"
         raw_result_path = run_root / "promptfoo.json"
         try:
@@ -2344,7 +2349,7 @@ def cmd_skill_benchmark(args, cfg):
         finally:
             if not args.keep_workspaces:
                 skill_eval.cleanup_benchmark_rows(rows, run_root)
-        print(raw_result_path)
+        print("Skill benchmark completed.")
     except skill_eval.SkillEvalError as exc:
         raise LabError(str(exc)) from exc
 

@@ -576,9 +576,10 @@ def build_benchmark_promptfoo_config(
     if not isinstance(target, TargetSpec):
         raise SkillEvalError("target must be a TargetSpec")
     validate_judge(target, judge_model)
-    benchmark_repetitions(profile)
+    repetitions = benchmark_repetitions(profile)
     if not isinstance(rows, list) or not rows:
         raise SkillEvalError("benchmark rows must be a nonempty list")
+    validate_benchmark_matrix(rows, profile)
 
     provider_config: dict[str, Any] = {
         "model": target.model,
@@ -630,6 +631,24 @@ def build_benchmark_promptfoo_config(
     }
     _write_promptfoo_config(output_path, config)
     return config
+
+
+def validate_benchmark_matrix(rows: list[BenchmarkRow], profile: str) -> None:
+    """Require the exact preregistered 18/90 paired benchmark matrix."""
+    expected_rows = 18 * benchmark_repetitions(profile)
+    if len(rows) != expected_rows:
+        raise SkillEvalError(f"benchmark matrix must contain exactly {expected_rows} rows")
+    pairs: dict[tuple[str, int], set[BenchmarkArm]] = {}
+    for row in rows:
+        if not isinstance(row, BenchmarkRow):
+            raise SkillEvalError("benchmark rows must contain BenchmarkRow entries")
+        pairs.setdefault((row.case_id, row.repetition), set()).add(row.arm)
+    repetitions = benchmark_repetitions(profile)
+    if len({case_id for case_id, _ in pairs}) != 9 or len(pairs) != 9 * repetitions:
+        raise SkillEvalError(f"benchmark matrix must contain exactly {expected_rows} rows")
+    expected_arms = {BenchmarkArm.CONTROL, BenchmarkArm.TREATMENT}
+    if any(arms != expected_arms for arms in pairs.values()):
+        raise SkillEvalError(f"benchmark matrix must contain exactly {expected_rows} rows")
 
 
 def run_promptfoo(

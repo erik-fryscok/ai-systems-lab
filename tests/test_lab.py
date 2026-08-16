@@ -607,7 +607,8 @@ class SkillEvalCommandTests(unittest.TestCase):
         self.assertEqual(benchmark_args.timeout, 900)
         self.assertFalse(benchmark_args.keep_workspaces)
 
-    def test_successful_cloud_benchmark_skips_local_lifecycle_and_cleans_paired_staging(self):
+    def test_successful_cloud_benchmark_skips_local_lifecycle_cleans_paired_staging_and_hides_raw_path(self):
+        output = io.StringIO()
         with mock.patch.object(
             lab, "require_skill_eval_dependencies", return_value={"promptfoo": "/promptfoo"}
         ), mock.patch.object(
@@ -618,7 +619,9 @@ class SkillEvalCommandTests(unittest.TestCase):
             lab, "benchmark_model_session"
         ) as benchmark_session, mock.patch.object(
             lab.skill_eval, "run_promptfoo"
-        ) as run_promptfoo, redirect_stdout(io.StringIO()):
+        ) as run_promptfoo, mock.patch.object(
+            lab.skill_eval, "validate_benchmark_matrix", create=True
+        ), redirect_stdout(output):
             lab.cmd_skill_benchmark(
                 self.command_args(target="openai:gpt-5.6-terra", judge_model="gpt-5.6"),
                 self.config,
@@ -630,6 +633,39 @@ class SkillEvalCommandTests(unittest.TestCase):
         benchmark_session.assert_not_called()
         self.assertEqual(list((run_root / "workspaces").iterdir()), [])
         self.assertEqual(list((run_root / "codex-homes").iterdir()), [])
+        self.assertEqual(output.getvalue(), "Skill benchmark completed.\n")
+        self.assertNotIn(str(run_root), output.getvalue())
+
+    def test_skill_benchmark_rejects_any_candidate_or_judge_other_than_the_preregistered_models(self):
+        with mock.patch.object(lab, "require_skill_eval_dependencies") as dependencies:
+            with self.assertRaisesRegex(lab.LabError, "openai:gpt-5.6-terra"):
+                lab.cmd_skill_benchmark(
+                    self.command_args(target="openai:gpt-5.6", judge_model="gpt-5.6"),
+                    self.config,
+                )
+            with self.assertRaisesRegex(lab.LabError, "gpt-5.6"):
+                lab.cmd_skill_benchmark(
+                    self.command_args(target="openai:gpt-5.6-terra", judge_model="gpt-5.6-mini"),
+                    self.config,
+                )
+
+        dependencies.assert_not_called()
+
+    def test_skill_benchmark_rejects_a_staged_non_nine_case_matrix_before_configuration(self):
+        with mock.patch.object(
+            lab, "require_skill_eval_dependencies", return_value={"promptfoo": "/promptfoo"}
+        ), mock.patch.object(
+            lab, "verify_skill_benchmark_revision"
+        ), mock.patch.object(
+            lab.skill_eval, "build_benchmark_promptfoo_config"
+        ) as build_config, mock.patch.object(lab.skill_eval, "run_promptfoo"):
+            with self.assertRaisesRegex(lab.LabError, "18 rows"):
+                lab.cmd_skill_benchmark(
+                    self.command_args(target="openai:gpt-5.6-terra", judge_model="gpt-5.6"),
+                    self.config,
+                )
+
+        build_config.assert_not_called()
 
     def test_skill_eval_rejects_an_invalid_target_before_dependency_or_inference_checks(self):
         args = Namespace(

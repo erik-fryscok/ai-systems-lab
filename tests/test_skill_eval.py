@@ -665,6 +665,18 @@ class PromptfooConfigTests(unittest.TestCase):
         self.assertIn({"type": "skill-used", "value": "safe-skill"}, treatment_direct["assert"])
         self.assertIn({"type": "not-skill-used", "value": "safe-skill"}, treatment_negative["assert"])
 
+    def test_benchmark_config_rejects_a_matrix_that_is_not_exactly_nine_cases_per_arm(self):
+        contract = skill_eval.load_skill_contract(self.skill_dir, self.eval_dir)
+        package = skill_eval.validate_skill_package(self.skill_dir)
+        rows = skill_eval.stage_benchmark_cases(
+            contract, package, 1, self.root / "incomplete-benchmark"
+        )
+
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "18 rows"):
+            skill_eval.build_benchmark_promptfoo_config(
+                self.local_target, "gpt-5.6-terra", rows[:-1], "smoke", self.output
+            )
+
     def test_judge_cannot_equal_candidate_across_provider_spellings(self):
         target = skill_eval.parse_target("openai:gpt-5.6-terra", self.cfg)
 
