@@ -811,7 +811,7 @@ def verify_benchmark_containment(rows: list[BenchmarkRow], raw_result: Mapping[s
             raise SkillEvalError("canary leakage")
         trace_text = json.dumps(trace, ensure_ascii=False).lower()
         forbidden_commands = tuple(pattern.lower() for row_case in (row.case,) for pattern in row_case.expected.forbidden.get("command_patterns", ()))
-        if any(marker in trace_text for marker in ('"network": true', '"forbidden_command": true', 'web_search', 'network_access', 'shell_command', 'terminal.command', 'command_execution', 'codex.search.query', '"name": "search')) or any(pattern in trace_text for pattern in forbidden_commands):
+        if any(marker in trace_text for marker in ('"network": true', '"forbidden_command": true', 'web_search', 'network_access', 'shell_command', 'terminal.command', 'command_execution', 'codex.search.query', 'codex.command', '"name": "search')) or any(pattern in trace_text for pattern in forbidden_commands):
             raise SkillEvalError("forbidden command/network")
         raw["_containment_safety"] = True
 

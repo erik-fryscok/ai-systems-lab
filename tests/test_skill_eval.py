@@ -885,7 +885,7 @@ class SkillBenchmarkSummaryTests(unittest.TestCase):
 
     def test_containment_rejects_baseline_mutation(self):
         (self.rows[0].workspace_dir / "README.md").write_text("changed\n", encoding="utf-8")
-        with self.assertRaisesRegex(skill_eval.SkillEvalError, "post-staging workspace mutation"):
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "non-regular entry"):
             skill_eval.verify_benchmark_containment(self.rows, self.raw_result(), self.root / "run")
 
     def test_containment_rejects_added_workspace_file(self):
@@ -897,6 +897,29 @@ class SkillBenchmarkSummaryTests(unittest.TestCase):
         (self.rows[0].workspace_dir / ".git" / "unexpected").write_text("changed\n", encoding="utf-8")
         with self.assertRaisesRegex(skill_eval.SkillEvalError, "post-staging workspace mutation"):
             skill_eval.verify_benchmark_containment(self.rows, self.raw_result(), self.root / "run")
+
+    def test_containment_rejects_empty_directory_and_mode_change(self):
+        (self.rows[0].workspace_dir / "empty").mkdir()
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "post-staging workspace mutation"):
+            skill_eval.verify_benchmark_containment(self.rows, self.raw_result(), self.root / "run")
+        (self.rows[0].workspace_dir / "empty").rmdir()
+        target = self.rows[0].workspace_dir / "README.md"
+        target.chmod(0o600)
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "post-staging workspace mutation"):
+            skill_eval.verify_benchmark_containment(self.rows, self.raw_result(), self.root / "run")
+
+    def test_containment_rejects_symlink_without_following_it(self):
+        (self.rows[0].workspace_dir / "link").symlink_to("README.md")
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "non-regular entry"):
+            skill_eval.verify_benchmark_containment(self.rows, self.raw_result(), self.root / "run")
+
+    def test_containment_rejects_structured_search_and_forbidden_command(self):
+        for attrs in ({"codex.search.query": "private"}, {"name": 'search "private"'}, {"codex.command": "curl blocked"}):
+            with self.subTest(attrs=attrs):
+                raw = self.raw_result()
+                raw["results"][0]["trace"] = [{"attributes": attrs}]
+                with self.assertRaisesRegex(skill_eval.SkillEvalError, "forbidden command/network"):
+                    skill_eval.verify_benchmark_containment(self.rows, raw, self.root / "run")
 
     def test_named_release_rejects_alternate_case_set_and_privileged_sandbox(self):
         named = [replace(row, skill_name="github-public-readiness") for row in self.rows]
