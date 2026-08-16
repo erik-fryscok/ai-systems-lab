@@ -277,6 +277,9 @@ def stage_benchmark_cases(
     validated_package = validate_skill_package(package.skill_dir)
     if package.digest != validated_package.digest or package.runtime_files != validated_package.runtime_files:
         raise SkillEvalError("skill package changed after validation")
+    for case in contract.cases:
+        fixture = _validated_fixture_for_staging(case.fixture, eval_dir)
+        _reject_fixture_skill_installation(fixture, contract.skill_name)
 
     resolved_run_root = _prepare_run_root(run_root)
     _reject_nested_paths(resolved_run_root, eval_dir, "run root", "eval directory")
@@ -362,6 +365,13 @@ def _stage_workspace(
     canaries = MappingProxyType(_new_canaries(row_name))
     canary_controls = _materialize_canary_controls(codex_home, canaries)
     return workspace_dir, codex_home, baseline_hashes, canaries, canary_controls
+
+
+def _reject_fixture_skill_installation(fixture: Path, skill_name: str) -> None:
+    """Keep benchmark controls free of the runtime skill under evaluation."""
+    fixture_skill = fixture / ".agents" / "skills" / skill_name
+    if fixture_skill.exists():
+        raise SkillEvalError("fixture must not preinstall the evaluated skill")
 
 
 def _write_verifier(

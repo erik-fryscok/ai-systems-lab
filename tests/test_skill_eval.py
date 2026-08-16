@@ -313,6 +313,16 @@ class SkillWorkspaceTests(unittest.TestCase):
         self.assertTrue(
             (treatment.workspace_dir / ".agents" / "skills" / contract.skill_name / "SKILL.md").is_file()
         )
+        for runtime_file in self.package.runtime_files:
+            self.assertTrue(
+                (
+                    treatment.workspace_dir
+                    / ".agents"
+                    / "skills"
+                    / contract.skill_name
+                    / runtime_file.relative_to(self.package.skill_dir)
+                ).is_file()
+            )
         control_verifier = json.loads(
             (self.run_root / "verifiers" / "direct-token-1-control.json").read_text(encoding="utf-8")
         )
@@ -323,6 +333,18 @@ class SkillWorkspaceTests(unittest.TestCase):
         self.assertIsNone(control_verifier["package_digest"])
         self.assertEqual(treatment_verifier["arm"], "treatment")
         self.assertEqual(treatment_verifier["package_digest"], self.package.digest)
+
+    def test_benchmark_staging_rejects_fixtures_that_preinstall_the_evaluated_skill(self):
+        fixture_skill = (
+            self.eval_dir / "fixtures" / "empty-repo" / ".agents" / "skills" / self.contract.skill_name
+        )
+        fixture_skill.mkdir(parents=True)
+        (fixture_skill / "SKILL.md").write_text("# Fixture skill\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "evaluated skill"):
+            skill_eval.stage_benchmark_cases(self.contract, self.package, 1, self.run_root)
+
+        self.assertFalse((self.run_root / "workspaces" / "direct-token-1-control").exists())
 
     def test_git_backed_skill_is_rejected_before_metadata_reaches_a_workspace(self):
         subprocess.run(("git", "init", "--quiet"), cwd=self.skill_dir, check=True)
