@@ -2327,12 +2327,17 @@ def cmd_skill_benchmark(args, cfg):
             run_root,
             keep_workspaces_on_error=args.keep_workspaces,
         )
-        skill_eval.validate_benchmark_matrix(rows, args.profile)
-        config_path = run_root / "promptfooconfig.yaml"
-        raw_result_path = run_root / "promptfoo.json"
-        contract_digest = hashlib.sha256(
-            (contract.eval_dir / "cases.yaml").read_bytes()
-        ).hexdigest()
+        try:
+            skill_eval.validate_benchmark_matrix(rows, args.profile)
+            config_path = run_root / "promptfooconfig.yaml"
+            raw_result_path = run_root / "promptfoo.json"
+            contract_digest = hashlib.sha256(
+                (contract.eval_dir / "cases.yaml").read_bytes()
+            ).hexdigest()
+        except BaseException:
+            if not args.keep_workspaces:
+                skill_eval.cleanup_benchmark_rows(rows, run_root)
+            raise
         provenance = {
             "candidate": args.target,
             "judge": args.judge_model,

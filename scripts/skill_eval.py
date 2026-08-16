@@ -726,6 +726,7 @@ def summarize_benchmark(
     if any(arms != {BenchmarkArm.CONTROL, BenchmarkArm.TREATMENT} for arms in supplied_pairs.values()):
         raise SkillEvalError("incomplete pair in benchmark rows")
     validate_benchmark_matrix(rows, "release")
+    _validate_preregistered_release_rows(rows)
     public_provenance = _validate_benchmark_provenance(provenance)
     observations = _parse_benchmark_observations(rows, raw_result, public_provenance)
     pairs: dict[tuple[str, int], dict[str, dict[str, Any]]] = {}
@@ -791,6 +792,11 @@ def verify_benchmark_containment(rows: list[BenchmarkRow], raw_result: Mapping[s
         if not isinstance(baseline_hashes, Mapping) or {
             path: actual_hashes.get(path) for path in baseline_hashes
         } != baseline_hashes:
+            raise SkillEvalError("read-only fixture mutation")
+        allowed_added = {path for path in actual_hashes if path.startswith(".git/")}
+        if row.arm is BenchmarkArm.TREATMENT:
+            allowed_added.update(path for path in actual_hashes if path.startswith(f".agents/skills/{row.skill_name}/"))
+        if set(actual_hashes) - set(baseline_hashes) - allowed_added:
             raise SkillEvalError("read-only fixture mutation")
         serialized = json.dumps(raw, ensure_ascii=False)
         if any(canary in serialized for canary in verifier.get("canaries", {}).values()):
@@ -964,6 +970,13 @@ def _validate_benchmark_provenance(provenance):
     if validated["skill_git_revision"] != "4480393" or validated["promptfoo_version"] != "0.122.0" or validated["codex_sdk_version"] != "0.147.0":
         raise SkillEvalError("invalid benchmark provenance")
     return validated
+
+
+def _validate_preregistered_release_rows(rows: list[BenchmarkRow]) -> None:
+    """Apply the public benchmark's fixed IDs/sandbox only to its named skill."""
+    if rows and rows[0].skill_name == "github-public-readiness":
+        if {row.case_id for row in rows} != set(PUBLIC_CASE_IDS) or any(row.case.sandbox != "read-only" for row in rows):
+            raise SkillEvalError("benchmark release rows must use the preregistered IDs and read-only sandbox")
 
 
 def _validate_public_shape(value, shape, label):

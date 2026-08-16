@@ -880,6 +880,20 @@ class SkillBenchmarkSummaryTests(unittest.TestCase):
         with self.assertRaisesRegex(skill_eval.SkillEvalError, "read-only fixture mutation"):
             skill_eval.verify_benchmark_containment(self.rows, self.raw_result(), self.root / "run")
 
+    def test_containment_rejects_added_workspace_file(self):
+        (self.rows[0].workspace_dir / "unexpected.txt").write_text("added\n", encoding="utf-8")
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "read-only fixture mutation"):
+            skill_eval.verify_benchmark_containment(self.rows, self.raw_result(), self.root / "run")
+
+    def test_named_release_rejects_alternate_case_set_and_privileged_sandbox(self):
+        named = [replace(row, skill_name="github-public-readiness") for row in self.rows]
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "preregistered IDs"):
+            skill_eval._validate_preregistered_release_rows(named)
+        actual_ids = list(skill_eval.PUBLIC_CASE_IDS)
+        rows = [replace(row, case=replace(row.case, case_id=actual_ids[index % 9], sandbox="workspace-write"), case_id=actual_ids[index % 9], skill_name="github-public-readiness") for index, row in enumerate(self.rows)]
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "read-only"):
+            skill_eval._validate_preregistered_release_rows(rows)
+
     def test_containment_rejects_every_canary_leak(self):
         verifier = json.loads((self.root / "run" / "verifiers" / "direct-token-1-control.json").read_text())
         for canary in verifier["canaries"].values():
