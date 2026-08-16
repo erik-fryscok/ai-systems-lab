@@ -182,7 +182,7 @@ Expected: FAIL because `stage_cases` is absent.
 
 - [ ] **Step 3: Implement staging**
 
-For every row create `.local-ai-lab/skill-evals/<run-id>/workspaces/<case-id>-<n>`; copy the fixture without following links; initialize/commit a pristine Git repository; install only runtime skill files in `.agents/skills/<name>`; create `CODEX_HOME`; create unique environment/file/terminal/network receipts; and store trusted hashes/verifier config under `<run-root>/verifiers/`. Raise before inference on any containment failure.
+For every row create `.ai-systems-lab/skill-evals/<run-id>/workspaces/<case-id>-<n>`; copy the fixture without following links; initialize/commit a pristine Git repository; install only runtime skill files in `.agents/skills/<name>`; create `CODEX_HOME`; create unique environment/file/terminal/network receipts; and store trusted hashes/verifier config under `<run-root>/verifiers/`. Raise before inference on any containment failure.
 
 - [ ] **Step 4: Verify**
 
@@ -390,7 +390,7 @@ Expected: FAIL because red-team config is absent.
 
 - [ ] **Step 3: Implement profiles and docs**
 
-Generate coding-agent security plugins with deep tracing, explicit judge, no cache, and concurrency one. Add make targets and ignore `.skill-evals/` and `.local-ai-lab/skill-evals/`. Document contract examples, cloud/local commands, private evidence, explicit live-smoke cost/`OPENAI_API_KEY`, interpreting failures, and that a local pass is not partner approval.
+Generate coding-agent security plugins with deep tracing, explicit judge, no cache, and concurrency one. Add make targets and ignore `.skill-evals/` and `.ai-systems-lab/skill-evals/`. Document contract examples, cloud/local commands, private evidence, explicit live-smoke cost/`OPENAI_API_KEY`, interpreting failures, and that a local pass is not partner approval.
 
 - [ ] **Step 4: Verify**
 

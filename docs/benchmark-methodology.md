@@ -2,7 +2,7 @@
 
 The public question is:
 
-> Can local AI ship it?
+> Where does each model/provider combination meet the workload contract?
 
 A faster failing result never outranks a slower passing result.
 
@@ -14,7 +14,8 @@ For a model comparison, hold these constant:
 - prompt and fresh conversation;
 - Git baseline and isolated worktree;
 - quantization class;
-- runtime and runtime version;
+- provider identity and provider model identifier;
+- local runtime and local-runtime version, when the candidate is local;
 - context limit;
 - issue acceptance contract;
 - validation commands.
@@ -53,14 +54,15 @@ then shorter elapsed time and lower peak memory.
 
 Every published experiment records:
 
-- exact model, quantization, runtime, context, and agent;
+- exact model, provider identity, provider model identifier, quantization,
+  local runtime version when applicable, context, and agent;
 - model release and verification dates;
 - public prompt and Git base;
 - attempts and human interventions;
 - validation commands and outcomes;
 - elapsed time and peak memory;
-- marginal API spend as `$0`, with hardware and electricity acknowledged
-  separately;
+- marginal API cost, including `$0` for local inference, with hardware and
+  electricity acknowledged separately;
 - accepted, repairable, or failed outcome;
 - known runtime and tooling limitations.
 

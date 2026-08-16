@@ -1,0 +1,31 @@
+{
+  "providers": {
+    "cloud-openai-compatible": {
+      "type": "openai_compatible",
+      "base_url": "https://api.openai.com/v1",
+      "api_key_env": "OPENAI_API_KEY",
+      "responses_api": true
+    }
+  },
+  "models": {
+    "cloud-example": {
+      "provider": "cloud-openai-compatible",
+      "provider_model": "gpt-5.5",
+      "description": "Opt-in cloud-hosted comparison model.",
+      "official_model_id": "openai/gpt-5.5",
+      "release_date": "2026-04",
+      "architecture": "hosted",
+      "parameters_total_b": null,
+      "parameters_active_b": null,
+      "quantization": null,
+      "license": "OpenAI services agreement",
+      "roles": ["coding", "reasoning", "comparison"],
+      "status": "candidate",
+      "expected_disk_gib": null,
+      "context_tokens": 1050000,
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-5.5",
+      "last_verified": null,
+      "agent_compatibility": {}
+    }
+  }
+}

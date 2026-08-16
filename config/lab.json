@@ -1,7 +1,13 @@
 {
+  "providers": {
+    "local-llama": {
+      "type": "llama_cpp",
+      "responses_api": true
+    }
+  },
   "paths": {
-    "models_dir": "~/Models/local-ai-lab",
-    "state_dir": ".local-ai-lab",
+    "models_dir": "~/Models/ai-systems-lab",
+    "state_dir": ".ai-systems-lab",
     "generated_dir": "config/generated",
     "results_dir": "benchmarks/results"
   },
@@ -42,7 +48,6 @@
     "quality_repetitions": 1,
     "judge": {
       "provider": "manual",
-      "base_url": "https://api.openai.com/v1",
       "model": null,
       "reasoning_effort": "low",
       "timeout_seconds": 120
@@ -95,6 +100,7 @@
   },
   "models": {
     "coder-30b": {
+      "provider": "local-llama",
       "description": "Retired historical agentic coding baseline: Qwen3-Coder 30B-A3B Instruct Q5_K_M.",
       "official_model_id": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
       "release_date": "2025-07",
@@ -126,6 +132,7 @@
       }
     },
     "reason-27b": {
+      "provider": "local-llama",
       "description": "Balanced dense reasoning and coding model: Qwen3.6 27B Q5_K_M.",
       "official_model_id": "Qwen/Qwen3.6-27B",
       "release_date": "2026-04",
@@ -156,6 +163,7 @@
       }
     },
     "fast-9b": {
+      "provider": "local-llama",
       "description": "Low-latency utility baseline: Qwen3.5 9B Q5_K_M.",
       "official_model_id": "Qwen/Qwen3.5-9B",
       "release_date": "2026-02",
@@ -186,6 +194,7 @@
       }
     },
     "gpt-oss-20b": {
+      "provider": "local-llama",
       "description": "Small reasoning and tool-use baseline: gpt-oss-20b MXFP4.",
       "official_model_id": "openai/gpt-oss-20b",
       "release_date": "2025-08-05",
@@ -217,6 +226,7 @@
       }
     },
     "qwen3.6-35b-a3b": {
+      "provider": "local-llama",
       "description": "Efficient sparse agent candidate: Qwen3.6 35B-A3B Q5_K_M.",
       "official_model_id": "Qwen/Qwen3.6-35B-A3B",
       "release_date": "2026-04",
@@ -247,6 +257,7 @@
       }
     },
     "devstral-small-2-24b": {
+      "provider": "local-llama",
       "description": "Balanced local coding-agent candidate: Devstral Small 2 24B Q5_K_M.",
       "official_model_id": "mistralai/Devstral-Small-2-24B-Instruct-2512",
       "release_date": "2025-12",
@@ -277,6 +288,7 @@
       }
     },
     "gpt-oss-120b": {
+      "provider": "local-llama",
       "description": "Flagship reasoning and review candidate: gpt-oss-120b MXFP4.",
       "official_model_id": "openai/gpt-oss-120b",
       "release_date": "2025-08-05",
@@ -310,6 +322,7 @@
       }
     },
     "qwen3.5-122b-a10b": {
+      "provider": "local-llama",
       "description": "Flagship sparse reasoning and review candidate: Qwen3.5 122B-A10B Q4_K_M.",
       "official_model_id": "Qwen/Qwen3.5-122B-A10B",
       "release_date": "2026-02",
@@ -344,6 +357,7 @@
       }
     },
     "gemma-4-12b": {
+      "provider": "local-llama",
       "description": "Multimodal general and UI-analysis candidate: Gemma 4 12B Q5_K_M.",
       "official_model_id": "google/gemma-4-12b-it",
       "release_date": "2026-06",
@@ -379,6 +393,7 @@
       }
     },
     "embed-4b": {
+      "provider": "local-llama",
       "description": "Retrieval-quality embedding default: Qwen3 Embedding 4B Q5_K_M.",
       "official_model_id": "Qwen/Qwen3-Embedding-4B",
       "release_date": "2025-06",

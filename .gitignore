@@ -1,6 +1,8 @@
 .DS_Store
 .worktrees/
 .idea/
+.ai-systems-lab/
+# Legacy runtime state retained for safe migration; remove manually when no longer needed.
 .local-ai-lab/
 .venv/
 node_modules/
