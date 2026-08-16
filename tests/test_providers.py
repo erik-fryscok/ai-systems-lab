@@ -37,6 +37,69 @@ class ProviderConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ProviderConfigError, "unknown provider 'missing'"):
             validate_provider_config(self.config)
 
+    def test_validate_rejects_malformed_json_shapes_with_actionable_errors(self):
+        malformed_configs = [
+            ([], "configuration must be an object"),
+            (
+                {"providers": {"local-llama": []}, "models": {}},
+                "provider 'local-llama' must be an object",
+            ),
+            (
+                {"providers": {"local-llama": {"type": "llama_cpp"}}, "models": []},
+                "models must be an object",
+            ),
+            (
+                {
+                    "providers": {"local-llama": {"type": "llama_cpp"}},
+                    "models": {"fast": []},
+                },
+                "model 'fast' must be an object",
+            ),
+            (
+                {
+                    "providers": {
+                        "cloud-openai": {
+                            "type": "openai_compatible",
+                            "base_url": 42,
+                            "api_key_env": "EXAMPLE_AI_API_KEY",
+                        }
+                    },
+                    "models": {},
+                },
+                "provider 'cloud-openai' base_url must be a non-empty string",
+            ),
+            (
+                {
+                    "providers": {
+                        "cloud-openai": {
+                            "type": "openai_compatible",
+                            "base_url": "https://api.example.test/v1",
+                            "api_key_env": "   ",
+                        }
+                    },
+                    "models": {},
+                },
+                "provider 'cloud-openai' api_key_env must be a non-empty string",
+            ),
+            (
+                {
+                    "providers": {"local-llama": {"type": "llama_cpp"}},
+                    "models": {
+                        "fast": {
+                            "provider": "local-llama",
+                            "provider_model": 42,
+                        }
+                    },
+                },
+                "model 'fast' provider_model must be a non-empty string",
+            ),
+        ]
+
+        for config, message in malformed_configs:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ProviderConfigError, message):
+                    validate_provider_config(config)
+
     def test_resolve_local_target_uses_gateway_and_alias(self):
         target = resolve_model_target(self.config, "fast", "http://127.0.0.1:8080/v1")
         self.assertEqual(target.provider_type, "llama_cpp")

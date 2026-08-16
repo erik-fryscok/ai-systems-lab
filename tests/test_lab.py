@@ -1054,6 +1054,47 @@ class ProviderCatalogTests(unittest.TestCase):
 
 
 class QualityTests(unittest.TestCase):
+    def test_gateway_models_route_advertises_only_active_local_targets(self):
+        config = {
+            "providers": {
+                "local": {"type": "llama_cpp"},
+                "cloud": {
+                    "type": "openai_compatible",
+                    "base_url": "https://api.example.test/v1",
+                    "api_key_env": "EXAMPLE_AI_API_KEY",
+                },
+            },
+            "models": {
+                "local-active": {"provider": "local", "status": "core"},
+                "local-retired": {"provider": "local", "status": "retired"},
+                "cloud-active": {"provider": "cloud", "status": "candidate"},
+            },
+        }
+        handler = object.__new__(lab.GatewayHandler)
+        handler.server = Namespace(gateway=Namespace(cfg=config))
+        handler.path = "/v1/models"
+        handler.wfile = io.BytesIO()
+        handler.send_response = mock.Mock()
+        handler.send_header = mock.Mock()
+        handler.end_headers = mock.Mock()
+
+        handler.do_GET()
+
+        payload = json.loads(handler.wfile.getvalue())
+        self.assertEqual(
+            payload,
+            {
+                "object": "list",
+                "data": [
+                    {
+                        "id": "local-active",
+                        "object": "model",
+                        "owned_by": "ai-systems-lab",
+                    }
+                ],
+            },
+        )
+
     def test_judge_config_rejects_obsolete_base_url_override(self):
         args = Namespace(
             judge_provider="manual",
@@ -1098,6 +1139,68 @@ class QualityTests(unittest.TestCase):
         self.assertEqual(result["provider"], "cloud-openai-compatible")
         self.assertEqual(result["model"], "cloud-example")
         self.assertEqual(result["timeout_seconds"], 45)
+
+    def test_quality_rejects_non_responses_judge_before_credentials_or_output_setup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prompt_path = root / "prompts.jsonl"
+            prompt_path.write_text(
+                json.dumps(
+                    {
+                        "name": "smoke",
+                        "messages": [{"role": "user", "content": "hello"}],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            config = {
+                "providers": {
+                    "candidate-provider": {
+                        "type": "openai_compatible",
+                        "base_url": "https://candidate.example.test/v1",
+                        "api_key_env": "MISSING_CANDIDATE_KEY",
+                    },
+                    "judge-provider": {
+                        "type": "openai_compatible",
+                        "base_url": "https://judge.example.test/v1",
+                        "api_key_env": "MISSING_JUDGE_KEY",
+                    },
+                },
+                "models": {
+                    "candidate": {"provider": "candidate-provider"},
+                    "judge": {"provider": "judge-provider"},
+                },
+                "paths": {"results_dir": str(root / "results")},
+                "benchmarks": {"quality_repetitions": 1},
+                "server": {"host": "127.0.0.1", "port": 8080},
+                "_config_path": str(root / "config.json"),
+            }
+            args = Namespace(
+                selector="candidate",
+                all_candidates=False,
+                skip_missing=False,
+                prompt_file=str(prompt_path),
+                limit_prompts=None,
+                repetitions=1,
+                max_tokens=64,
+                temperature=0.2,
+                timeout=30,
+                unload_after=False,
+                judge_provider="judge-provider",
+                judge_base_url=None,
+                judge_model="judge",
+                judge_reasoning_effort="low",
+                judge_timeout=45,
+            )
+
+            with mock.patch.dict(os.environ, {}, clear=True):
+                with self.assertRaisesRegex(
+                    lab.LabError, "does not support the Responses API judge"
+                ):
+                    lab.cmd_bench_quality(args, config)
+
+            self.assertFalse((root / "results").exists())
 
     def test_judge_config_rejects_model_from_another_provider(self):
         args = Namespace(
@@ -1159,6 +1262,7 @@ class QualityTests(unittest.TestCase):
                     "type": "openai_compatible",
                     "base_url": "https://api.example.test/v1",
                     "api_key_env": "EXAMPLE_AI_API_KEY",
+                    "responses_api": True,
                 }
             },
             "models": {"cloud-judge": {"provider": "cloud-openai-compatible"}},
@@ -1224,7 +1328,44 @@ class QualityTests(unittest.TestCase):
         request_args, request_kwargs = request.call_args
         self.assertEqual(request_args[1], "https://api.example.test/v1/responses")
         self.assertEqual(request_args[2]["model"], "vendor/judge-v1")
+        self.assertIn("candidate response", request_args[2]["instructions"])
+        self.assertNotIn("local LLM", request_args[2]["instructions"])
+        self.assertNotIn("cloud", request_args[2]["instructions"].lower())
         self.assertEqual(request_kwargs["headers"], {"Authorization": "Bearer secret-value"})
+
+    def test_responses_api_judge_error_uses_provider_neutral_wording(self):
+        args = Namespace(
+            judge_provider="cloud-openai-compatible",
+            judge_base_url=None,
+            judge_model="cloud-example",
+            judge_reasoning_effort="low",
+            judge_timeout=45,
+        )
+        config = {
+            "providers": {
+                "cloud-openai-compatible": {
+                    "type": "openai_compatible",
+                    "base_url": "https://api.example.test/v1",
+                    "api_key_env": "EXAMPLE_AI_API_KEY",
+                    "responses_api": True,
+                }
+            },
+            "models": {
+                "cloud-example": {"provider": "cloud-openai-compatible"}
+            },
+            "server": {"host": "127.0.0.1", "port": 8080},
+        }
+        judge_cfg = lab.judge_config(config, args)
+
+        with mock.patch.dict(
+            os.environ, {"EXAMPLE_AI_API_KEY": "secret-value"}, clear=True
+        ), mock.patch.object(lab, "json_request", return_value={}):
+            with self.assertRaisesRegex(
+                lab.LabError, "Responses API judge returned no output text"
+            ):
+                lab.score_quality_response(
+                    config, judge_cfg, {"candidate_response": "answer"}
+                )
 
     def test_default_quality_judge_is_manual(self):
         args = Namespace(

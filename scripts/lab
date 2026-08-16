@@ -1196,9 +1196,11 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(data)
 
     def _stable_models(self):
+        providers = self.server.gateway.cfg.get("providers", {})
         data = [{"id": model_id, "object": "model", "owned_by": "ai-systems-lab"}
                 for model_id, entry in sorted(self.server.gateway.cfg.get("models", {}).items())
-                if entry.get("status") != "retired"]
+                if entry.get("status") != "retired"
+                and providers.get(entry.get("provider"), {}).get("type") == "llama_cpp"]
         body = json.dumps({"object": "list", "data": data}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -2795,7 +2797,7 @@ QUALITY_SCORE_SCHEMA = {
 }
 
 
-JUDGE_INSTRUCTIONS = """You are an impartial evaluator for local LLM benchmark responses.
+JUDGE_INSTRUCTIONS = """You are an impartial evaluator for candidate model responses.
 Score only the candidate response against the original task and rubric.
 Do not reward verbosity. Penalize incorrect claims, missed constraints, unsafe code, and failure to follow output format.
 Use 5 for excellent, 4 for good with minor issues, 3 for usable but meaningfully flawed, 2 for poor, and 1 for wrong or unusable.
@@ -2913,6 +2915,10 @@ def judge_config(cfg, args):
         raise LabError(
             f"Judge model '{model_id}' does not belong to judge provider '{provider}'."
         )
+    if not target.is_local and not target.responses_api:
+        raise LabError(
+            f"provider '{target.provider}' does not support the Responses API judge"
+        )
     return {
         "provider": provider,
         "model": model_id,
@@ -2934,7 +2940,7 @@ def validate_quality_score(score):
             raise LabError(f"Judge returned invalid {key} list.")
 
 
-def openai_score_response(target, judge_cfg, eval_payload):
+def responses_api_score_response(target, judge_cfg, eval_payload):
     url, payload, headers = responses_json_request(
         target,
         JUDGE_INSTRUCTIONS,
@@ -2953,11 +2959,11 @@ def openai_score_response(target, judge_cfg, eval_payload):
     latency = time.perf_counter() - started
     raw_text = response_output_text(response)
     if not raw_text:
-        raise LabError("Remote judge returned no output text.")
+        raise LabError("Responses API judge returned no output text.")
     try:
         score = json.loads(raw_text)
     except json.JSONDecodeError as exc:
-        raise LabError(f"Remote judge returned invalid JSON: {raw_text}") from exc
+        raise LabError(f"Responses API judge returned invalid JSON: {raw_text}") from exc
     validate_quality_score(score)
     return {
         "score": score,
@@ -3034,7 +3040,7 @@ def score_quality_response(cfg, judge_cfg, eval_payload):
     target = judge_cfg["target"]
     if target.is_local:
         return local_score_response(cfg, judge_cfg, eval_payload)
-    return openai_score_response(target, judge_cfg, eval_payload)
+    return responses_api_score_response(target, judge_cfg, eval_payload)
 
 
 def quality_eval_payload(selector, model_id, prompt, candidate_text):

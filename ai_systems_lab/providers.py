@@ -10,6 +10,10 @@ class ProviderConfigError(Exception):
     pass
 
 
+def _is_non_empty_string(value):
+    return isinstance(value, str) and bool(value.strip())
+
+
 @dataclass(frozen=True)
 class ModelTarget:
     alias: str
@@ -26,27 +30,62 @@ class ModelTarget:
 
 
 def validate_provider_config(cfg):
+    if not isinstance(cfg, dict):
+        raise ProviderConfigError("configuration must be an object")
     providers = cfg.get("providers")
     if not isinstance(providers, dict) or not providers:
         raise ProviderConfigError("providers must be a non-empty object")
     for name, provider in providers.items():
+        if not _is_non_empty_string(name):
+            raise ProviderConfigError("provider names must be non-empty strings")
+        if not isinstance(provider, dict):
+            raise ProviderConfigError(f"provider '{name}' must be an object")
         provider_type = provider.get("type")
+        if not _is_non_empty_string(provider_type):
+            raise ProviderConfigError(
+                f"provider '{name}' type must be a non-empty string"
+            )
         if provider_type not in SUPPORTED_PROVIDER_TYPES:
             raise ProviderConfigError(
                 f"provider '{name}' has unsupported type {provider_type!r}"
             )
         if provider_type == "openai_compatible":
-            if not provider.get("base_url"):
-                raise ProviderConfigError(f"provider '{name}' requires base_url")
-            if not provider.get("api_key_env"):
-                raise ProviderConfigError(f"provider '{name}' requires api_key_env")
-    for alias, model in cfg.get("models", {}).items():
+            if not _is_non_empty_string(provider.get("base_url")):
+                raise ProviderConfigError(
+                    f"provider '{name}' base_url must be a non-empty string"
+                )
+            if not _is_non_empty_string(provider.get("api_key_env")):
+                raise ProviderConfigError(
+                    f"provider '{name}' api_key_env must be a non-empty string"
+                )
+        if "responses_api" in provider and not isinstance(
+            provider["responses_api"], bool
+        ):
+            raise ProviderConfigError(
+                f"provider '{name}' responses_api must be a boolean"
+            )
+    models = cfg.get("models", {})
+    if not isinstance(models, dict):
+        raise ProviderConfigError("models must be an object")
+    for alias, model in models.items():
+        if not _is_non_empty_string(alias):
+            raise ProviderConfigError("model aliases must be non-empty strings")
+        if not isinstance(model, dict):
+            raise ProviderConfigError(f"model '{alias}' must be an object")
         provider_name = model.get("provider")
-        if not provider_name:
-            raise ProviderConfigError(f"model '{alias}' requires provider")
+        if not _is_non_empty_string(provider_name):
+            raise ProviderConfigError(
+                f"model '{alias}' provider must be a non-empty string"
+            )
         if provider_name not in providers:
             raise ProviderConfigError(
                 f"model '{alias}' references unknown provider '{provider_name}'"
+            )
+        if "provider_model" in model and (
+            not _is_non_empty_string(model["provider_model"])
+        ):
+            raise ProviderConfigError(
+                f"model '{alias}' provider_model must be a non-empty string"
             )
 
 
