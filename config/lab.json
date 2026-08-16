@@ -7,7 +7,6 @@
   },
   "paths": {
     "models_dir": "~/Models/ai-systems-lab",
-    "legacy_models_dir": "~/Models/local-ai-lab",
     "state_dir": ".ai-systems-lab",
     "generated_dir": "config/generated",
     "results_dir": "benchmarks/results"

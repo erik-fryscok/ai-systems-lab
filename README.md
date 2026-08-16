@@ -1,12 +1,11 @@
 # AI Systems Lab
 
-AI Systems Lab is an experimental learning and evaluation testbed, not
-production infrastructure. Local llama.cpp remains a first-class backend and
-the default workflow, while cloud-hosted OpenAI-compatible providers can
-participate in the same chat and evaluation paths. Workload aliases choose
-models, and each model resolves through a provider boundary. Provider
-credentials are opt-in environment variables and are never stored in committed
-configuration.
+AI Systems Lab is an experimental learning and evaluation testbed, not production infrastructure.
+Local llama.cpp remains a first-class backend and the default workflow, while
+cloud-hosted OpenAI-compatible providers can participate in the same chat and
+evaluation paths. Workload aliases choose models, and each model resolves
+through a provider boundary. Provider credentials are opt-in environment
+variables and are never stored in committed configuration.
 
 The local default runs one persistent llama.cpp gateway with workload-specific
 model aliases, repeatable Hugging Face pulls, and benchmark output you can

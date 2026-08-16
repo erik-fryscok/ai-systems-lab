@@ -57,6 +57,7 @@ LAUNCH_AGENT_PATH = Path.home() / "Library" / "LaunchAgents" / f"{SERVICE_LABEL}
 LEGACY_LAUNCH_AGENT_PATH = (
     Path.home() / "Library" / "LaunchAgents" / f"{LEGACY_SERVICE_LABEL}.plist"
 )
+LEGACY_MODELS_DIR = Path.home() / "Models" / "local-ai-lab"
 _LEGACY_MODELS_WARNINGS = set()
 DEFAULT_SERVICE_STATE = {
     "auto_idle_enabled": True,
@@ -229,7 +230,7 @@ def repo_path(value):
 def paths(cfg):
     raw = cfg.get("paths", {})
     models_dir = configured_models_dir(cfg)
-    legacy_models_dir = raw.get("legacy_models_dir")
+    legacy_models_dir = raw.get("legacy_models_dir", LEGACY_MODELS_DIR)
     if not models_dir.exists() and legacy_models_dir:
         legacy_path = repo_path(legacy_models_dir)
         warning_key = (models_dir, legacy_path)

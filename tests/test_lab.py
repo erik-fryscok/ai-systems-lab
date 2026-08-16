@@ -21,6 +21,18 @@ lab = importlib.util.module_from_spec(SPEC)
 LOADER.exec_module(lab)
 
 
+class BrandingTests(unittest.TestCase):
+    def test_project_metadata_uses_new_identity(self):
+        metadata = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn('name = "ai-systems-lab"', metadata)
+        self.assertIn("github.com/erik-fryscok/ai-systems-lab", metadata)
+        self.assertTrue(readme.startswith("# AI Systems Lab\n"))
+        self.assertIn("not production infrastructure", readme)
+        self.assertIn("local", readme.lower())
+        self.assertIn("cloud", readme.lower())
+
+
 class IdentityMigrationTests(unittest.TestCase):
     def test_new_environment_name_wins_over_legacy_name(self):
         with mock.patch.dict(
@@ -60,10 +72,10 @@ class IdentityMigrationTests(unittest.TestCase):
             config = {
                 "paths": {
                     "models_dir": str(root / "ai-systems-lab"),
-                    "legacy_models_dir": str(legacy),
                 }
             }
-            self.assertEqual(lab.paths(config)["models_dir"], legacy.resolve())
+            with mock.patch.object(lab, "LEGACY_MODELS_DIR", legacy):
+                self.assertEqual(lab.paths(config)["models_dir"], legacy.resolve())
 
     def test_readme_migration_requires_an_absent_new_models_directory(self):
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
@@ -1560,7 +1572,7 @@ class GatewayTests(unittest.TestCase):
             (model_dir / "fast.gguf").touch()
             config = {
                 "providers": {"local": {"type": "llama_cpp"}},
-                "paths": {"state_dir": ".local-ai-lab", "models_dir": directory},
+                "paths": {"state_dir": ".ai-systems-lab", "models_dir": directory},
                 "models": {"fast": {"provider": "local", "status": "core", "files": ["fast.gguf"], "local_dir": "fast"}},
             }
             lab.save_service_state({
