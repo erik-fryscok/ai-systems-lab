@@ -770,5 +770,88 @@ class PromptfooExecutionTests(unittest.TestCase):
                 )
 
 
+class SkillBenchmarkSummaryTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        root = Path(self.temporary_directory.name)
+        skill_dir = root / "skills" / "safe-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("# Safe skill\n", encoding="utf-8")
+        eval_dir = root / ".skill-evals" / "safe-skill"
+        (eval_dir / "fixtures" / "empty-repo").mkdir(parents=True)
+        (eval_dir / "fixtures" / "empty-repo" / "README.md").write_text("fixture\n", encoding="utf-8")
+        (eval_dir / "cases.yaml").write_text(BENCHMARK_CASES, encoding="utf-8")
+        contract = skill_eval.load_skill_contract(skill_dir, eval_dir)
+        package = skill_eval.validate_skill_package(skill_dir)
+        self.rows = skill_eval.stage_benchmark_cases(contract, package, 5, root / "run")
+        self.provenance = {
+            "candidate": "openai:gpt-5.6-terra", "judge": "gpt-5.6",
+            "skill_git_revision": "4480393", "skill_digest": package.digest,
+            "contract_digest": "a" * 64, "promptfoo_version": "0.122.0",
+            "codex_sdk_version": "0.147.0",
+        }
+
+    def raw_result(self, rows=None):
+        return {"results": [{
+            "vars": {"arm": row.arm.value, "caseId": row.case_id,
+                     "repetition": row.repetition, "promptDigest": "b" * 64,
+                     "fixtureDigest": "c" * 64, "sandbox": row.case.sandbox,
+                     "candidate": self.provenance["candidate"], "judge": self.provenance["judge"],
+                     "contractDigest": self.provenance["contract_digest"]},
+            "success": True, "assertions": [
+                {"type": "contains", "pass": True}, {"type": "skill-used", "pass": True},
+                {"type": "llm-rubric", "pass": True}, {"type": "safety", "pass": True},
+            ], "latencyMs": 1000, "tokenUsage": {"prompt": 10, "completion": 5}, "cost": 0.01,
+            "output": "must never reach a summary",
+        } for row in (rows or self.rows)]}
+
+    def test_summarizes_complete_release_pairs_without_copying_raw_output(self):
+        summary = skill_eval.summarize_benchmark(self.rows, self.raw_result(), self.provenance)
+
+        self.assertEqual(summary["run"], {"profile": "release", "cases": 9, "arms": 2, "repetitions": 5, "valid_pairs": 45})
+        self.assertEqual(summary["metrics"]["control"]["task_pass_rate"], 1.0)
+        self.assertEqual(summary["metrics"]["treatment"]["input_tokens"], 450)
+        self.assertNotIn("must never reach a summary", json.dumps(summary))
+
+    def test_rejects_a_missing_control_pair(self):
+        rows = [row for row in self.rows if row.arm is skill_eval.BenchmarkArm.TREATMENT]
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "incomplete pair"):
+            skill_eval.summarize_benchmark(rows, self.raw_result(rows), self.provenance)
+
+    def test_rejects_mismatched_prompt_digest_within_a_pair(self):
+        raw = self.raw_result()
+        raw["results"][1]["vars"]["promptDigest"] = "d" * 64
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "prompt digest"):
+            skill_eval.summarize_benchmark(self.rows, raw, self.provenance)
+
+    def test_rejects_mismatched_candidate_provenance(self):
+        raw = self.raw_result()
+        raw["results"][0]["vars"]["candidate"] = "openai:other"
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "candidate provenance"):
+            skill_eval.summarize_benchmark(self.rows, raw, self.provenance)
+
+    def test_bootstrap_interval_is_seed_pinned(self):
+        self.assertEqual(skill_eval.paired_bootstrap([0, 1, 1, -1], samples=100), [-0.63125, 1.0])
+
+    def test_public_result_rejects_raw_answer_and_unknown_fields(self):
+        for key, value in {
+            "raw_prompt": "secret request", "raw_answer": "not publishable", "trace": "private trace",
+            "path": "/Users/example/private", "authorization": "Bearer secret", "email": "person@example.com",
+            "hostname": "runner.internal", "canary": "canary-token", "unexpected": "value",
+        }.items():
+            with self.subTest(key=key), self.assertRaises(skill_eval.SkillEvalError):
+                skill_eval.validate_benchmark_public_result({key: value})
+
+    def test_public_result_rejects_sensitive_values_in_allowed_fields(self):
+        summary = skill_eval.summarize_benchmark(self.rows, self.raw_result(), self.provenance)
+        for value in ("/Users/example/private", "Authorization: Bearer secret", "person@example.com", "runner.internal", "canary-token", "raw answer", "trace transcript"):
+            with self.subTest(value=value):
+                payload = dict(summary)
+                payload["limitations"] = [value]
+                with self.assertRaises(skill_eval.SkillEvalError):
+                    skill_eval.validate_benchmark_public_result(payload)
+
+
 if __name__ == "__main__":
     unittest.main()

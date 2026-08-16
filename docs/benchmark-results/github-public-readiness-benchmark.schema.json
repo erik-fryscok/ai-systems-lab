@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GitHub public-readiness paired benchmark",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "benchmark_id", "provenance", "run", "metrics", "case_results", "limitations", "privacy_review"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "benchmark_id": {"const": "github-public-readiness-paired-v1"},
+    "provenance": {"$ref": "#/$defs/provenance"},
+    "run": {"$ref": "#/$defs/run"},
+    "metrics": {"$ref": "#/$defs/metrics"},
+    "case_results": {"type": "array", "items": {"$ref": "#/$defs/case"}},
+    "limitations": {"type": "array", "items": {"type": "string"}},
+    "privacy_review": {"type": "object", "additionalProperties": false, "required": ["automated_export_validation", "manual_review"], "properties": {"automated_export_validation": {"type": "boolean"}, "manual_review": {"type": "boolean"}}}
+  },
+  "$defs": {
+    "provenance": {"type": "object", "additionalProperties": false, "required": ["candidate", "judge", "skill_git_revision", "skill_digest", "contract_digest", "promptfoo_version", "codex_sdk_version"], "properties": {"candidate": {"const": "openai:gpt-5.6-terra"}, "judge": {"const": "gpt-5.6"}, "skill_git_revision": {"const": "4480393"}, "skill_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"}, "contract_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"}, "promptfoo_version": {"const": "0.122.0"}, "codex_sdk_version": {"const": "0.147.0"}}},
+    "run": {"type": "object", "additionalProperties": false, "required": ["profile", "cases", "arms", "repetitions", "valid_pairs"], "properties": {"profile": {"const": "release"}, "cases": {"const": 9}, "arms": {"const": 2}, "repetitions": {"const": 5}, "valid_pairs": {"const": 45}}},
+    "arm": {"type": "object", "additionalProperties": false, "required": ["task_pass_rate", "safety_pass_rate", "median_latency_seconds", "latency_range_seconds", "input_tokens", "output_tokens", "estimated_cost_usd"], "properties": {"task_pass_rate": {"type": "number"}, "safety_pass_rate": {"type": "number"}, "median_latency_seconds": {"type": "number"}, "latency_range_seconds": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "number"}}, "input_tokens": {"type": "number"}, "output_tokens": {"type": "number"}, "estimated_cost_usd": {"type": "number"}}},
+    "metrics": {"type": "object", "additionalProperties": false, "required": ["control", "treatment", "paired_deltas"], "properties": {"control": {"$ref": "#/$defs/arm"}, "treatment": {"$ref": "#/$defs/treatment_arm"}, "paired_deltas": {"type": "object", "additionalProperties": false, "required": ["task_pass_rate", "safety_pass_rate"], "properties": {"task_pass_rate": {"$ref": "#/$defs/delta"}, "safety_pass_rate": {"$ref": "#/$defs/delta"}}}}},
+    "treatment_arm": {"type": "object", "additionalProperties": false, "required": ["task_pass_rate", "safety_pass_rate", "activation_accuracy", "median_latency_seconds", "latency_range_seconds", "input_tokens", "output_tokens", "estimated_cost_usd"], "properties": {"task_pass_rate": {"type": "number"}, "safety_pass_rate": {"type": "number"}, "activation_accuracy": {"type": "number"}, "median_latency_seconds": {"type": "number"}, "latency_range_seconds": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "number"}}, "input_tokens": {"type": "number"}, "output_tokens": {"type": "number"}, "estimated_cost_usd": {"type": "number"}}},
+    "delta": {"type": "object", "additionalProperties": false, "required": ["value", "ci95"], "properties": {"value": {"type": "number"}, "ci95": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "number"}}}},
+    "case": {"type": "object", "additionalProperties": false, "required": ["case_id", "category", "control_pass_rate", "treatment_pass_rate", "delta"], "properties": {"case_id": {"type": "string"}, "category": {"type": "string"}, "control_pass_rate": {"type": "number"}, "treatment_pass_rate": {"type": "number"}, "delta": {"type": "number"}}}
+  }
+}

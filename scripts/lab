@@ -2330,9 +2330,21 @@ def cmd_skill_benchmark(args, cfg):
         skill_eval.validate_benchmark_matrix(rows, args.profile)
         config_path = run_root / "promptfooconfig.yaml"
         raw_result_path = run_root / "promptfoo.json"
+        contract_digest = hashlib.sha256(
+            (contract.eval_dir / "cases.yaml").read_bytes()
+        ).hexdigest()
+        provenance = {
+            "candidate": args.target,
+            "judge": args.judge_model,
+            "skill_git_revision": "4480393",
+            "skill_digest": package.digest,
+            "contract_digest": contract_digest,
+            "promptfoo_version": "0.122.0",
+            "codex_sdk_version": "0.147.0",
+        }
         try:
             skill_eval.build_benchmark_promptfoo_config(
-                target, args.judge_model, rows, args.profile, config_path
+                target, args.judge_model, rows, args.profile, config_path, contract_digest
             )
             session = (
                 benchmark_model_session(cfg, target.alias, args.timeout)
@@ -2351,10 +2363,19 @@ def cmd_skill_benchmark(args, cfg):
                     raise LabError(
                         f"Skill benchmark execution failed with exit {exc.returncode}."
                     ) from exc
+            if args.profile == "release":
+                try:
+                    raw_result = json.loads(raw_result_path.read_text(encoding="utf-8"))
+                    summary = skill_eval.summarize_benchmark(rows, raw_result, provenance)
+                    (run_root / "benchmark-summary.json").write_text(
+                        json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+                    )
+                except (OSError, json.JSONDecodeError, skill_eval.SkillEvalError) as exc:
+                    raise LabError(f"Skill benchmark aggregation failed: {exc}") from exc
         finally:
             if not args.keep_workspaces:
                 skill_eval.cleanup_benchmark_rows(rows, run_root)
-        print("Skill benchmark completed.")
+        print(run_root)
     except skill_eval.SkillEvalError as exc:
         raise LabError(str(exc)) from exc
 
@@ -3476,6 +3497,28 @@ def cmd_export_public(args, cfg):
     print(output_path)
 
 
+def cmd_export_benchmark_public(args, cfg):
+    run_dir = Path(args.run_dir).expanduser().resolve()
+    summary_path = run_dir / "benchmark-summary.json"
+    if not run_dir.is_dir() or not summary_path.is_file():
+        raise LabError("Completed private benchmark run does not contain benchmark-summary.json")
+    output_path = Path(args.output).expanduser().resolve()
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        public_result = skill_eval.project_benchmark_public_result(summary)
+    except (OSError, json.JSONDecodeError, skill_eval.SkillEvalError) as exc:
+        raise LabError(str(exc)) from exc
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            json.dumps(public_result, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        raise LabError(f"Could not write public benchmark result: {exc}") from exc
+    print(output_path)
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="AI Systems Lab llama.cpp orchestration.")
     parser.add_argument("--config", default=project_env("CONFIG") or str(DEFAULT_CONFIG))
@@ -3639,6 +3682,10 @@ def build_parser():
     skill_benchmark_parser.add_argument("--timeout", type=int, default=900)
     skill_benchmark_parser.add_argument("--keep-workspaces", action="store_true")
 
+    export_benchmark = sub.add_parser("export-benchmark-public")
+    export_benchmark.add_argument("run_dir")
+    export_benchmark.add_argument("--output", required=True)
+
     return parser
 
 
@@ -3675,6 +3722,7 @@ COMMANDS = {
     "skill-eval": cmd_skill_eval,
     "skill-redteam": cmd_skill_redteam,
     "skill-benchmark": cmd_skill_benchmark,
+    "export-benchmark-public": cmd_export_benchmark_public,
     "export-public": cmd_export_public,
 }
 

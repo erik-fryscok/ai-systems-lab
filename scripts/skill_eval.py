@@ -2,9 +2,11 @@
 
 import hashlib
 import json
+import random
 import re
 import secrets
 import shutil
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -40,6 +42,41 @@ DETERMINISTIC_ASSERTION_TYPES = (
     "regex",
     "not-regex",
     "starts-with",
+)
+PUBLIC_BENCHMARK_ID = "github-public-readiness-paired-v1"
+PUBLIC_PROVENANCE_KEYS = (
+    "candidate", "judge", "skill_git_revision", "skill_digest", "contract_digest",
+    "promptfoo_version", "codex_sdk_version",
+)
+_NUMBER = (int, float)
+_ARM_METRICS_SHAPE = {
+    "task_pass_rate": _NUMBER, "safety_pass_rate": _NUMBER, "median_latency_seconds": _NUMBER,
+    "latency_range_seconds": (list, _NUMBER), "input_tokens": _NUMBER, "output_tokens": _NUMBER,
+    "estimated_cost_usd": _NUMBER,
+}
+_PUBLIC_RESULT_SHAPE = {
+    "schema_version": int, "benchmark_id": str,
+    "provenance": {key: str for key in PUBLIC_PROVENANCE_KEYS},
+    "run": {"profile": str, "cases": int, "arms": int, "repetitions": int, "valid_pairs": int},
+    "metrics": {
+        "control": _ARM_METRICS_SHAPE,
+        "treatment": {**_ARM_METRICS_SHAPE, "activation_accuracy": _NUMBER},
+        "paired_deltas": {
+            "task_pass_rate": {"value": _NUMBER, "ci95": (list, _NUMBER)},
+            "safety_pass_rate": {"value": _NUMBER, "ci95": (list, _NUMBER)},
+        },
+    },
+    "case_results": (list, {"case_id": str, "category": str, "control_pass_rate": _NUMBER,
+                             "treatment_pass_rate": _NUMBER, "delta": _NUMBER}),
+    "limitations": (list, str),
+    "privacy_review": {"automated_export_validation": bool, "manual_review": bool},
+}
+_PUBLIC_PRIVACY_PATTERNS = (
+    (r"(?:^|[\s\"'])/(?:Users|home|private|var)/", "a private user path"),
+    (r"authorization\s*:\s*bearer\s+[^\s\"']+", "a bearer token"),
+    (r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", "an email address"),
+    (r"\b[a-z0-9-]+\.(?:internal|local|corp)\b", "an internal hostname"),
+    (r"canary|session(?:[_ -]?id)?|raw[_ -]?(?:prompt|answer)|trace|transcript", "private evaluation content"),
 )
 
 
@@ -571,6 +608,7 @@ def build_benchmark_promptfoo_config(
     rows: list[BenchmarkRow],
     profile: str,
     output_path: Path,
+    contract_digest: Optional[str] = None,
 ) -> dict:
     """Compile a no-cache Promptfoo configuration for paired benchmark rows."""
     if not isinstance(target, TargetSpec):
@@ -625,7 +663,7 @@ def build_benchmark_promptfoo_config(
         "description": f"Paired skill benchmark ({profile}) for {target.selector}",
         "prompts": ["{{prompt}}"],
         "providers": [{"id": "openai:codex-sdk", "config": provider_config}],
-        "tests": [_benchmark_promptfoo_test(row, judge_model) for row in rows],
+        "tests": [_benchmark_promptfoo_test(row, judge_model, target.selector, contract_digest) for row in rows],
         "evaluateOptions": {"maxConcurrency": 1},
         "writeLatestResults": False,
     }
@@ -655,6 +693,238 @@ def validate_benchmark_matrix(rows: list[BenchmarkRow], profile: str) -> None:
         case_repetitions.setdefault(case_id, set()).add(repetition)
     if any(actual != expected_repetitions for actual in case_repetitions.values()):
         raise SkillEvalError("benchmark matrix has invalid case repetitions")
+
+
+def paired_bootstrap(values: list[float], seed: int = 20260816, samples: int = 10_000) -> list[float]:
+    """Return the deterministic percentile bootstrap interval for paired deltas."""
+    if not values or not isinstance(samples, int) or samples < 1:
+        raise SkillEvalError("bootstrap requires values and a positive sample count")
+    rng = random.Random(seed)
+    estimates = sorted(sum(rng.choice(values) for _ in values) / len(values) for _ in range(samples))
+    return [_quantile(estimates, 0.025), _quantile(estimates, 0.975)]
+
+
+def summarize_benchmark(
+    rows: list[BenchmarkRow], raw_result: Mapping[str, Any], provenance: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Build a private aggregate only after validating every preregistered release pair."""
+    supplied_pairs: dict[tuple[str, int], set[BenchmarkArm]] = {}
+    for row in rows:
+        if not isinstance(row, BenchmarkRow):
+            raise SkillEvalError("benchmark rows must contain BenchmarkRow entries")
+        supplied_pairs.setdefault((row.case_id, row.repetition), set()).add(row.arm)
+    if any(arms != {BenchmarkArm.CONTROL, BenchmarkArm.TREATMENT} for arms in supplied_pairs.values()):
+        raise SkillEvalError("incomplete pair in benchmark rows")
+    validate_benchmark_matrix(rows, "release")
+    public_provenance = _validate_benchmark_provenance(provenance)
+    observations = _parse_benchmark_observations(rows, raw_result, public_provenance)
+    pairs: dict[tuple[str, int], dict[str, dict[str, Any]]] = {}
+    for observation in observations:
+        pairs.setdefault((observation["case_id"], observation["repetition"]), {})[observation["arm"]] = observation
+    if len(pairs) != 45 or any(set(pair) != {"control", "treatment"} for pair in pairs.values()):
+        raise SkillEvalError("incomplete pair in benchmark results")
+    for pair in pairs.values():
+        control, treatment = pair["control"], pair["treatment"]
+        for key, label in (("prompt_digest", "prompt digest"), ("fixture_digest", "fixture digest"), ("sandbox", "sandbox")):
+            if control[key] != treatment[key]:
+                raise SkillEvalError(f"mismatched {label} within pair")
+
+    by_arm = {arm: [item for item in observations if item["arm"] == arm] for arm in ("control", "treatment")}
+    metrics = {arm: _arm_metrics(items, activation=arm == "treatment") for arm, items in by_arm.items()}
+    task_deltas = [pair["treatment"]["task"] - pair["control"]["task"] for pair in pairs.values()]
+    safety_deltas = [pair["treatment"]["safety"] - pair["control"]["safety"] for pair in pairs.values()]
+    case_results = []
+    for case_id in sorted({row.case_id for row in rows}):
+        case_pairs = [pair for (paired_case, _), pair in pairs.items() if paired_case == case_id]
+        case = next(row.case for row in rows if row.case_id == case_id)
+        control_rate = sum(pair["control"]["task"] for pair in case_pairs) / len(case_pairs)
+        treatment_rate = sum(pair["treatment"]["task"] for pair in case_pairs) / len(case_pairs)
+        case_results.append({"case_id": case_id, "category": case.category, "control_pass_rate": control_rate,
+                             "treatment_pass_rate": treatment_rate, "delta": treatment_rate - control_rate})
+    return {
+        "schema_version": 1, "benchmark_id": PUBLIC_BENCHMARK_ID, "provenance": public_provenance,
+        "run": {"profile": "release", "cases": 9, "arms": 2, "repetitions": 5, "valid_pairs": 45},
+        "metrics": {**metrics, "paired_deltas": {
+            "task_pass_rate": {"value": sum(task_deltas) / len(task_deltas), "ci95": paired_bootstrap(task_deltas)},
+            "safety_pass_rate": {"value": sum(safety_deltas) / len(safety_deltas), "ci95": paired_bootstrap(safety_deltas)},
+        }},
+        "case_results": case_results,
+        "limitations": ["Synthetic repositories bound the result to the authored cases."],
+        "privacy_review": {"automated_export_validation": True, "manual_review": True},
+    }
+
+
+def validate_benchmark_public_result(payload: Mapping[str, Any]) -> None:
+    """Fail closed on anything outside the versioned public aggregate contract."""
+    if not isinstance(payload, Mapping):
+        raise SkillEvalError("public benchmark result must be an object")
+    _validate_public_shape(payload, _PUBLIC_RESULT_SHAPE, "result")
+    if payload["schema_version"] != 1 or payload["benchmark_id"] != PUBLIC_BENCHMARK_ID:
+        raise SkillEvalError("public benchmark result has an unsupported identity")
+    _validate_benchmark_provenance(payload["provenance"])
+    if payload["run"] != {"profile": "release", "cases": 9, "arms": 2, "repetitions": 5, "valid_pairs": 45}:
+        raise SkillEvalError("public benchmark result has invalid run metadata")
+    for arm in ("control", "treatment"):
+        if len(payload["metrics"][arm]["latency_range_seconds"]) != 2:
+            raise SkillEvalError("public benchmark latency range must contain two values")
+    for metric in payload["metrics"]["paired_deltas"].values():
+        if len(metric["ci95"]) != 2:
+            raise SkillEvalError("public benchmark confidence interval must contain two values")
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    for pattern, label in _PUBLIC_PRIVACY_PATTERNS:
+        if re.search(pattern, serialized, flags=re.IGNORECASE):
+            raise SkillEvalError(f"public benchmark result contains {label}")
+
+
+def project_benchmark_public_result(summary: Mapping[str, Any]) -> dict[str, Any]:
+    """Copy only schema-approved aggregate fields from a private summary."""
+    if not isinstance(summary, Mapping):
+        raise SkillEvalError("private benchmark summary must be an object")
+    projected = _project_public_value(summary, _PUBLIC_RESULT_SHAPE, "result")
+    validate_benchmark_public_result(projected)
+    return projected
+
+
+def _parse_benchmark_observations(rows, raw_result, provenance):
+    if not isinstance(raw_result, Mapping):
+        raise SkillEvalError("raw benchmark result must be an object")
+    raw_rows = raw_result.get("results")
+    if isinstance(raw_rows, Mapping):
+        raw_rows = raw_rows.get("results")
+    if not isinstance(raw_rows, list):
+        raise SkillEvalError("raw benchmark result must contain results")
+    expected = {(row.arm.value, row.case_id, row.repetition): row for row in rows}
+    if len(raw_rows) != len(expected):
+        raise SkillEvalError("incomplete pair in benchmark results")
+    observations = []
+    seen = set()
+    for raw in raw_rows:
+        if not isinstance(raw, Mapping):
+            raise SkillEvalError("raw benchmark result row is invalid")
+        test_case = raw.get("testCase")
+        vars = raw.get("vars") if isinstance(raw.get("vars"), Mapping) else (
+            test_case.get("vars") if isinstance(test_case, Mapping) else None
+        )
+        if not isinstance(vars, Mapping):
+            raise SkillEvalError("raw benchmark result row is invalid")
+        key = (vars.get("arm"), vars.get("caseId"), vars.get("repetition"))
+        if key not in expected or key in seen:
+            raise SkillEvalError("incomplete pair in benchmark results")
+        seen.add(key)
+        row = expected[key]
+        if vars.get("sandbox") != row.case.sandbox:
+            raise SkillEvalError("mismatched sandbox provenance")
+        for field, label in (("candidate", "candidate"), ("judge", "judge"), ("contractDigest", "contract")):
+            provenance_key = {"candidate": "candidate", "judge": "judge", "contractDigest": "contract_digest"}[field]
+            if vars.get(field) != provenance[provenance_key]:
+                raise SkillEvalError(f"mismatched {label} provenance")
+        prompt_digest = _require_digest(vars.get("promptDigest"), "prompt digest")
+        fixture_digest = _require_digest(vars.get("fixtureDigest"), "fixture digest")
+        assertions = raw.get("assertions")
+        if not isinstance(assertions, list):
+            raise SkillEvalError("raw benchmark assertions are missing")
+        outcomes = _assertion_outcomes(assertions, bool(raw.get("success")))
+        usage = raw.get("tokenUsage") if isinstance(raw.get("tokenUsage"), Mapping) else {}
+        observations.append({"arm": row.arm.value, "case_id": row.case_id, "repetition": row.repetition,
+                             "prompt_digest": prompt_digest, "fixture_digest": fixture_digest, "sandbox": row.case.sandbox,
+                             **outcomes, "latency": _number(raw.get("latencyMs", 0)) / 1000,
+                             "input_tokens": _number(usage.get("prompt", usage.get("input", 0))),
+                             "output_tokens": _number(usage.get("completion", usage.get("output", 0))), "cost": _number(raw.get("cost", 0))})
+    if seen != set(expected):
+        raise SkillEvalError("incomplete pair in benchmark results")
+    return observations
+
+
+def _assertion_outcomes(assertions, success):
+    passed = lambda item: bool(item.get("pass", item.get("success", False))) if isinstance(item, Mapping) else False
+    deterministic = [passed(item) for item in assertions if item.get("type") in DETERMINISTIC_ASSERTION_TYPES]
+    activation = [passed(item) for item in assertions if item.get("type") in {"skill-used", "not-skill-used"}]
+    rubric = [passed(item) for item in assertions if item.get("type") == "llm-rubric"]
+    safety = [passed(item) for item in assertions if item.get("type") == "safety"]
+    return {"task": int(success and all(deterministic) and all(rubric)), "safety": int(all(safety) if safety else success),
+            "activation": int(all(activation) if activation else False), "rubric": int(all(rubric) if rubric else False)}
+
+
+def _arm_metrics(items, activation):
+    latencies = [item["latency"] for item in items]
+    value = {"task_pass_rate": sum(item["task"] for item in items) / len(items),
+             "safety_pass_rate": sum(item["safety"] for item in items) / len(items),
+             "median_latency_seconds": statistics.median(latencies), "latency_range_seconds": [min(latencies), max(latencies)],
+             "input_tokens": sum(item["input_tokens"] for item in items), "output_tokens": sum(item["output_tokens"] for item in items),
+             "estimated_cost_usd": sum(item["cost"] for item in items)}
+    if activation:
+        value["activation_accuracy"] = sum(item["activation"] for item in items) / len(items)
+    return value
+
+
+def _quantile(sorted_values, probability):
+    position = (len(sorted_values) - 1) * probability
+    lower, upper = int(position), min(int(position) + 1, len(sorted_values) - 1)
+    return sorted_values[lower] + (sorted_values[upper] - sorted_values[lower]) * (position - lower)
+
+
+def _number(value):
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+        raise SkillEvalError("benchmark metric must be a non-negative number")
+    return value
+
+
+def _require_digest(value, label):
+    if not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{64}", value):
+        raise SkillEvalError(f"{label} must be a sha256 digest")
+    return value
+
+
+def _validate_benchmark_provenance(provenance):
+    if not isinstance(provenance, Mapping) or set(provenance) != set(PUBLIC_PROVENANCE_KEYS):
+        raise SkillEvalError("invalid benchmark provenance")
+    validated = dict(provenance)
+    for key in ("skill_digest", "contract_digest"):
+        _require_digest(validated[key], key)
+    if validated["candidate"] != "openai:gpt-5.6-terra" or validated["judge"] != "gpt-5.6":
+        raise SkillEvalError("invalid candidate or judge provenance")
+    if validated["skill_git_revision"] != "4480393" or validated["promptfoo_version"] != "0.122.0" or validated["codex_sdk_version"] != "0.147.0":
+        raise SkillEvalError("invalid benchmark provenance")
+    return validated
+
+
+def _validate_public_shape(value, shape, label):
+    if isinstance(shape, dict):
+        if not isinstance(value, Mapping):
+            raise SkillEvalError(f"{label} must be an object")
+        unknown = set(value) - set(shape)
+        if unknown:
+            raise SkillEvalError(f"{label} contains unknown field: {sorted(unknown)[0]}")
+        missing = set(shape) - set(value)
+        if missing:
+            raise SkillEvalError(f"{label} is missing field: {sorted(missing)[0]}")
+        for key, child_shape in shape.items():
+            _validate_public_shape(value[key], child_shape, f"{label}.{key}")
+        return
+    if isinstance(shape, tuple) and shape[0] is list:
+        if not isinstance(value, list):
+            raise SkillEvalError(f"{label} must be a list")
+        for index, item in enumerate(value):
+            _validate_public_shape(item, shape[1], f"{label}[{index}]")
+        return
+    if shape == _NUMBER:
+        if not isinstance(value, _NUMBER) or isinstance(value, bool):
+            raise SkillEvalError(f"{label} must be a number")
+    elif not isinstance(value, shape) or (shape is int and isinstance(value, bool)):
+        raise SkillEvalError(f"{label} has an invalid type")
+
+
+def _project_public_value(value, shape, label):
+    if isinstance(shape, dict):
+        if not isinstance(value, Mapping):
+            raise SkillEvalError(f"{label} must be an object")
+        return {key: _project_public_value(value.get(key), child_shape, f"{label}.{key}")
+                for key, child_shape in shape.items()}
+    if isinstance(shape, tuple) and shape[0] is list:
+        if not isinstance(value, list):
+            raise SkillEvalError(f"{label} must be a list")
+        return [_project_public_value(item, shape[1], f"{label}[]") for item in value]
+    return value
 
 
 def run_promptfoo(
@@ -772,7 +1042,9 @@ def _promptfoo_test(row: StagedCase, judge_model: str) -> dict[str, Any]:
     }
 
 
-def _benchmark_promptfoo_test(row: BenchmarkRow, judge_model: str) -> dict[str, Any]:
+def _benchmark_promptfoo_test(
+    row: BenchmarkRow, judge_model: str, candidate: str, contract_digest: Optional[str] = None
+) -> dict[str, Any]:
     if not isinstance(row, BenchmarkRow):
         raise SkillEvalError("benchmark rows must contain BenchmarkRow entries")
     if row.case.case_id != row.case_id:
@@ -783,13 +1055,25 @@ def _benchmark_promptfoo_test(row: BenchmarkRow, judge_model: str) -> dict[str, 
         "vars": {
             "arm": row.arm.value,
             "caseId": row.case_id,
+            "repetition": row.repetition,
             "codexHome": str(row.codex_home),
             "prompt": row.case.prompt,
+            "promptDigest": hashlib.sha256(row.case.prompt.encode("utf-8")).hexdigest(),
+            "fixtureDigest": _fixture_digest(row.baseline_hashes),
+            "sandbox": row.case.sandbox,
+            "candidate": candidate,
+            "judge": judge_model,
+            "contractDigest": contract_digest,
             "sandboxMode": row.case.sandbox,
             "workspaceDir": str(row.workspace_dir),
         },
         "assert": _benchmark_assertions(row, judge_model),
     }
+
+
+def _fixture_digest(baseline_hashes: Mapping[str, str]) -> str:
+    encoded = json.dumps(dict(baseline_hashes), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _benchmark_assertions(row: BenchmarkRow, judge_model: str) -> list[dict[str, str]]:

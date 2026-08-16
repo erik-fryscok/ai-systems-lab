@@ -633,8 +633,7 @@ class SkillEvalCommandTests(unittest.TestCase):
         benchmark_session.assert_not_called()
         self.assertEqual(list((run_root / "workspaces").iterdir()), [])
         self.assertEqual(list((run_root / "codex-homes").iterdir()), [])
-        self.assertEqual(output.getvalue(), "Skill benchmark completed.\n")
-        self.assertNotIn(str(run_root), output.getvalue())
+        self.assertEqual(output.getvalue(), f"{run_root}\n")
 
     def test_skill_benchmark_rejects_any_candidate_or_judge_other_than_the_preregistered_models(self):
         with mock.patch.object(lab, "require_skill_eval_dependencies") as dependencies:
@@ -1893,6 +1892,29 @@ class PublicExportTests(unittest.TestCase):
         row = exported["artifacts"]["results.jsonl"][0]
         self.assertEqual(row, {"model": "fast-9b", "latency_seconds": 1.2})
         self.assertNotIn("repo", exported["artifacts"]["metadata.json"])
+
+    def test_export_benchmark_public_projects_only_the_strict_aggregate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_dir = root / "private-run"
+            run_dir.mkdir()
+            private = {
+                "schema_version": 1, "benchmark_id": "github-public-readiness-paired-v1",
+                "provenance": {"candidate": "openai:gpt-5.6-terra", "judge": "gpt-5.6", "skill_git_revision": "4480393", "skill_digest": "a" * 64, "contract_digest": "b" * 64, "promptfoo_version": "0.122.0", "codex_sdk_version": "0.147.0"},
+                "run": {"profile": "release", "cases": 9, "arms": 2, "repetitions": 5, "valid_pairs": 45},
+                "metrics": {"control": {"task_pass_rate": 1, "safety_pass_rate": 1, "median_latency_seconds": 1, "latency_range_seconds": [1, 1], "input_tokens": 1, "output_tokens": 1, "estimated_cost_usd": 0}, "treatment": {"task_pass_rate": 1, "safety_pass_rate": 1, "activation_accuracy": 1, "median_latency_seconds": 1, "latency_range_seconds": [1, 1], "input_tokens": 1, "output_tokens": 1, "estimated_cost_usd": 0}, "paired_deltas": {"task_pass_rate": {"value": 0, "ci95": [0, 0]}, "safety_pass_rate": {"value": 0, "ci95": [0, 0]}}},
+                "case_results": [], "limitations": ["Synthetic repositories bound the result to the authored cases."],
+                "privacy_review": {"automated_export_validation": True, "manual_review": True},
+                "raw_answer": "must not be exported",
+            }
+            (run_dir / "benchmark-summary.json").write_text(json.dumps(private), encoding="utf-8")
+            output = root / "public.json"
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                lab.cmd_export_benchmark_public(Namespace(run_dir=str(run_dir), output=str(output)), {})
+            self.assertEqual(stdout.getvalue(), f"{output.resolve()}\n")
+            exported = json.loads(output.read_text(encoding="utf-8"))
+            self.assertNotIn("raw_answer", exported)
 
 
 if __name__ == "__main__":
