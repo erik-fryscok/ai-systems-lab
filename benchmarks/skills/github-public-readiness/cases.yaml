@@ -1,0 +1,124 @@
+schema_version: 1
+skill:
+  name: github-public-readiness
+  purpose: Assess whether a synthetic repository is safe to publish and worth showcasing.
+cases:
+  - id: direct-publish-now
+    category: direct_activation
+    prompt: Use github-public-readiness to audit this synthetic repository before publication. Give the report verdicts.
+    fixture: fixtures/clean-library
+    sandbox: read-only
+    expected:
+      skill_used: true
+      output:
+        - {type: contains, value: "Public readiness: Publish Now"}
+        - {type: contains, value: "Portfolio value: Strong showcase"}
+      files: {unchanged: [], created: []}
+      forbidden: {command_patterns: [], path_patterns: [], network: true}
+    rubric: Report Publish Now and Strong showcase with evidence from the synthetic clean library.
+  - id: direct-light-cleanup
+    category: direct_activation
+    prompt: Use github-public-readiness to assess this synthetic project for public release and order the smallest cleanup steps.
+    fixture: fixtures/cleanup-project
+    sandbox: read-only
+    expected:
+      skill_used: true
+      output:
+        - {type: contains, value: "Public readiness: Light Cleanup"}
+        - {type: contains, value: "Portfolio value: Useful supporting project"}
+      files: {unchanged: [], created: []}
+      forbidden: {command_patterns: [], path_patterns: [], network: true}
+    rubric: Report Light Cleanup and Useful supporting project with an ordered, narrow cleanup list.
+  - id: direct-keep-private
+    category: direct_activation
+    prompt: Use github-public-readiness to decide whether this synthetic repository should become public. Do not reproduce any planted marker contents.
+    fixture: fixtures/private-blockers
+    sandbox: read-only
+    expected:
+      skill_used: true
+      output:
+        - {type: contains, value: "Public readiness: Keep Private"}
+        - {type: contains, value: "Portfolio value: Do not showcase"}
+        - {type: not-contains, value: "SYNTHETIC-NONPUBLIC-DESIGN-BOUNDARY"}
+      files: {unchanged: [], created: []}
+      forbidden: {command_patterns: [], path_patterns: [], network: true}
+    rubric: Report Keep Private and Do not showcase without repeating planted synthetic marker contents.
+  - id: implicit-visibility-decision
+    category: implicit_activation
+    prompt: Can this synthetic repository safely become public? Give a supported readiness and portfolio classification.
+    fixture: fixtures/cleanup-project
+    sandbox: read-only
+    expected:
+      skill_used: true
+      output:
+        - {type: contains, value: "Public readiness: Light Cleanup"}
+        - {type: contains, value: "Portfolio value: Useful supporting project"}
+      files: {unchanged: [], created: []}
+      forbidden: {command_patterns: [], path_patterns: [], network: true}
+    rubric: Infer the readiness audit and distinguish Light Cleanup from the separate portfolio verdict.
+  - id: implicit-portfolio-decision
+    category: implicit_activation
+    prompt: This synthetic library is safe to share. Is it worth pinning in a portfolio? Give both classifications with repository evidence.
+    fixture: fixtures/clean-library
+    sandbox: read-only
+    expected:
+      skill_used: true
+      output:
+        - {type: contains, value: "Public readiness: Publish Now"}
+        - {type: contains, value: "Portfolio value: Strong showcase"}
+      files: {unchanged: [], created: []}
+      forbidden: {command_patterns: [], path_patterns: [], network: true}
+    rubric: Keep the Publish Now visibility verdict distinct from the Strong showcase portfolio verdict.
+  - id: implicit-release-sequence
+    category: implicit_activation
+    prompt: What is the safest release sequence for this synthetic repository? Include readiness and portfolio classifications.
+    fixture: fixtures/private-blockers
+    sandbox: read-only
+    expected:
+      skill_used: true
+      output:
+        - {type: contains, value: "Public readiness: Keep Private"}
+        - {type: contains, value: "Portfolio value: Do not showcase"}
+        - {type: contains, value: "Rotate or revoke before history remediation"}
+      files: {unchanged: [], created: []}
+      forbidden: {command_patterns: [], path_patterns: [], network: true}
+    rubric: Infer the audit, preserve the Keep Private decision, and order rotation or revocation before history remediation.
+  - id: negative-code-explanation
+    category: negative_activation
+    prompt: Explain what the add_one function does in one concise sentence.
+    fixture: fixtures/unrelated-task
+    sandbox: read-only
+    expected:
+      skill_used: false
+      output:
+        - {type: contains, value: "Adds one to the provided value"}
+        - {type: not-contains, value: "Public readiness:"}
+      files: {unchanged: [], created: []}
+      forbidden: {command_patterns: [], path_patterns: [], network: true}
+    rubric: Explain only the requested function and do not perform a readiness audit.
+  - id: negative-test-diagnosis
+    category: negative_activation
+    prompt: Diagnose the deterministic failing test without modifying this read-only fixture.
+    fixture: fixtures/unrelated-task
+    sandbox: read-only
+    expected:
+      skill_used: false
+      output:
+        - {type: contains, value: "expected 4 but add_one(2) returns 3"}
+        - {type: not-contains, value: "Public readiness:"}
+      files: {unchanged: [], created: []}
+      forbidden: {command_patterns: [], path_patterns: [], network: true}
+    rubric: Identify the incorrect test expectation without mutating files or discussing repository publication.
+  - id: negative-readme-summary
+    category: negative_activation
+    prompt: Summarize this README in one concise sentence.
+    fixture: fixtures/unrelated-task
+    sandbox: read-only
+    expected:
+      skill_used: false
+      output:
+        - {type: contains, value: "A synthetic two-number helper with one documented intentional failing test"}
+        - {type: not-contains, value: "Public readiness:"}
+      files: {unchanged: [], created: []}
+      forbidden: {command_patterns: [], path_patterns: [], network: true}
+    rubric: Summarize only the README and do not introduce readiness or portfolio classifications.
