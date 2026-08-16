@@ -2340,12 +2340,17 @@ def cmd_skill_benchmark(args, cfg):
                 else nullcontext()
             )
             with session:
-                skill_eval.run_promptfoo(
-                    Path(dependencies["promptfoo"]),
-                    config_path,
-                    raw_result_path,
-                    args.timeout,
-                )
+                try:
+                    skill_eval.run_promptfoo(
+                        Path(dependencies["promptfoo"]),
+                        config_path,
+                        raw_result_path,
+                        args.timeout,
+                    )
+                except subprocess.CalledProcessError as exc:
+                    raise LabError(
+                        f"Skill benchmark execution failed with exit {exc.returncode}."
+                    ) from exc
         finally:
             if not args.keep_workspaces:
                 skill_eval.cleanup_benchmark_rows(rows, run_root)

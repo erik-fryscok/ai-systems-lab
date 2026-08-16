@@ -3,6 +3,7 @@ import json
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -675,6 +676,19 @@ class PromptfooConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(skill_eval.SkillEvalError, "18 rows"):
             skill_eval.build_benchmark_promptfoo_config(
                 self.local_target, "gpt-5.6-terra", rows[:-1], "smoke", self.output
+            )
+
+    def test_benchmark_config_rejects_rows_with_an_invalid_release_repetition_set(self):
+        contract = skill_eval.load_skill_contract(self.skill_dir, self.eval_dir)
+        package = skill_eval.validate_skill_package(self.skill_dir)
+        rows = skill_eval.stage_benchmark_cases(
+            contract, package, 5, self.root / "invalid-release-repetitions"
+        )
+        invalid_rows = [replace(row, repetition=6) if row.repetition == 5 else row for row in rows]
+
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "repetitions"):
+            skill_eval.build_benchmark_promptfoo_config(
+                self.local_target, "gpt-5.6-terra", invalid_rows, "release", self.output
             )
 
     def test_judge_cannot_equal_candidate_across_provider_spellings(self):

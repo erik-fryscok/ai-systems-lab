@@ -667,6 +667,42 @@ class SkillEvalCommandTests(unittest.TestCase):
 
         build_config.assert_not_called()
 
+    def test_skill_benchmark_promptfoo_failure_hides_private_paths_from_stderr(self):
+        (self.root / "models").mkdir()
+        args = self.command_args(target="openai:gpt-5.6-terra", judge_model="gpt-5.6")
+        args.command = "skill-benchmark"
+        args.config = "private-config.json"
+        parser = mock.Mock()
+        parser.parse_args.return_value = args
+        stderr = io.StringIO()
+
+        def promptfoo_failure(_binary, config_path, raw_result_path, _timeout):
+            raise subprocess.CalledProcessError(
+                7,
+                ["/private/promptfoo", "eval", "--config", str(config_path), "--output", str(raw_result_path)],
+            )
+
+        with mock.patch.object(lab, "build_parser", return_value=parser), mock.patch.object(
+            lab, "load_config", return_value=self.config
+        ), mock.patch.object(
+            lab, "require_skill_eval_dependencies", return_value={"promptfoo": "/private/promptfoo"}
+        ), mock.patch.object(
+            lab, "verify_skill_benchmark_revision"
+        ), mock.patch.object(
+            lab.skill_eval, "validate_benchmark_matrix"
+        ), mock.patch.object(
+            lab.skill_eval, "build_benchmark_promptfoo_config"
+        ), mock.patch.object(
+            lab.skill_eval, "run_promptfoo", side_effect=promptfoo_failure
+        ), redirect_stderr(stderr):
+            status = lab.main()
+
+        self.assertEqual(status, 1)
+        self.assertEqual(stderr.getvalue(), "error: Skill benchmark execution failed with exit 7.\n")
+        self.assertNotIn("/private", stderr.getvalue())
+        self.assertNotIn("promptfooconfig.yaml", stderr.getvalue())
+        self.assertNotIn("promptfoo.json", stderr.getvalue())
+
     def test_skill_eval_rejects_an_invalid_target_before_dependency_or_inference_checks(self):
         args = Namespace(
             skill_dir="skill-dir",

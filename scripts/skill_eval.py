@@ -649,6 +649,12 @@ def validate_benchmark_matrix(rows: list[BenchmarkRow], profile: str) -> None:
     expected_arms = {BenchmarkArm.CONTROL, BenchmarkArm.TREATMENT}
     if any(arms != expected_arms for arms in pairs.values()):
         raise SkillEvalError(f"benchmark matrix must contain exactly {expected_rows} rows")
+    expected_repetitions = set(range(1, repetitions + 1))
+    case_repetitions: dict[str, set[int]] = {}
+    for case_id, repetition in pairs:
+        case_repetitions.setdefault(case_id, set()).add(repetition)
+    if any(actual != expected_repetitions for actual in case_repetitions.values()):
+        raise SkillEvalError("benchmark matrix has invalid case repetitions")
 
 
 def run_promptfoo(
