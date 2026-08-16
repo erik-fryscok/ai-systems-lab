@@ -287,6 +287,43 @@ class SkillWorkspaceTests(unittest.TestCase):
         self.assertEqual(set(rows[0].canaries), {"environment", "file", "terminal", "network"})
         self.assertTrue(rows[0].baseline_hashes["README.md"])
 
+    def test_benchmark_staging_creates_isolated_control_and_treatment_arms(self):
+        contract = skill_eval.SkillContract(
+            self.contract.schema_version,
+            self.contract.skill_name,
+            self.contract.purpose,
+            (self.contract.cases[0],),
+            self.contract.eval_dir,
+        )
+        rows = skill_eval.stage_benchmark_cases(contract, self.package, 1, self.run_root)
+        control, treatment = rows
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual((control.arm, treatment.arm), (skill_eval.BenchmarkArm.CONTROL, skill_eval.BenchmarkArm.TREATMENT))
+        self.assertEqual(control.case_id, treatment.case_id)
+        self.assertEqual(control.repetition, treatment.repetition)
+        self.assertNotEqual(control.workspace_dir, treatment.workspace_dir)
+        self.assertNotEqual(control.codex_home, treatment.codex_home)
+        self.assertEqual(control.baseline_hashes, treatment.baseline_hashes)
+        self.assertEqual(control.case, treatment.case)
+        self.assertEqual(control.case.prompt, treatment.case.prompt)
+        self.assertEqual(control.case.sandbox, treatment.case.sandbox)
+        self.assertEqual(control.skill_name, treatment.skill_name)
+        self.assertFalse((control.workspace_dir / ".agents" / "skills" / contract.skill_name).exists())
+        self.assertTrue(
+            (treatment.workspace_dir / ".agents" / "skills" / contract.skill_name / "SKILL.md").is_file()
+        )
+        control_verifier = json.loads(
+            (self.run_root / "verifiers" / "direct-token-1-control.json").read_text(encoding="utf-8")
+        )
+        treatment_verifier = json.loads(
+            (self.run_root / "verifiers" / "direct-token-1-treatment.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(control_verifier["arm"], "control")
+        self.assertIsNone(control_verifier["package_digest"])
+        self.assertEqual(treatment_verifier["arm"], "treatment")
+        self.assertEqual(treatment_verifier["package_digest"], self.package.digest)
+
     def test_git_backed_skill_is_rejected_before_metadata_reaches_a_workspace(self):
         subprocess.run(("git", "init", "--quiet"), cwd=self.skill_dir, check=True)
 

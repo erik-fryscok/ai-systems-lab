@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping, Optional, Tuple
@@ -91,6 +92,25 @@ class StagedCase:
     canaries: Mapping[str, str]
     baseline_hashes: Mapping[str, str]
     case: SkillCase
+    skill_name: str
+
+
+class BenchmarkArm(str, Enum):
+    """The isolated condition used for a paired skill benchmark row."""
+
+    CONTROL = "control"
+    TREATMENT = "treatment"
+
+
+@dataclass(frozen=True)
+class BenchmarkRow:
+    arm: BenchmarkArm
+    case_id: str
+    repetition: int
+    workspace_dir: Path
+    codex_home: Path
+    case: SkillCase
+    baseline_hashes: Mapping[str, str]
     skill_name: str
 
 
@@ -208,38 +228,16 @@ def stage_cases(
     created_directories: list[tuple[Path, Path, str]] = []
     try:
         for case in contract.cases:
-            fixture = _validated_fixture_for_staging(case.fixture, eval_dir)
             _require_safe_case_id(case.case_id)
             for repetition in range(1, repetitions + 1):
                 row_name = f"{case.case_id}-{repetition}"
-                workspace_dir = _new_child_directory(workspace_root, row_name, "workspace")
-                created_directories.append((workspace_dir, workspace_root, "workspace"))
-                codex_home = _new_child_directory(codex_root, row_name, "CODEX_HOME")
-                created_directories.append((codex_home, codex_root, "CODEX_HOME"))
-                _copy_fixture(fixture, workspace_dir)
-                baseline_hashes = MappingProxyType(_hash_regular_files(workspace_dir))
-                _initialize_pristine_git_repository(workspace_dir)
+                workspace_dir, codex_home, baseline_hashes, canaries, canary_controls = _stage_workspace(
+                    case, row_name, eval_dir, workspace_root, codex_root, created_directories
+                )
                 _install_runtime_skill(validated_package, workspace_dir, contract.skill_name)
-
-                canaries = MappingProxyType(_new_canaries(row_name))
-                canary_controls = _materialize_canary_controls(codex_home, canaries)
-                verifier_path = _new_child_file(verifier_root, f"{row_name}.json", "verifier configuration")
-                verifier_path.write_text(
-                    json.dumps(
-                        {
-                            "baseline_hashes": dict(baseline_hashes),
-                            "canaries": dict(canaries),
-                            "canary_controls": canary_controls,
-                            "case_id": case.case_id,
-                            "package_digest": validated_package.digest,
-                            "repetition": repetition,
-                            "sandbox": case.sandbox,
-                        },
-                        indent=2,
-                        sort_keys=True,
-                    )
-                    + "\n",
-                    encoding="utf-8",
+                _write_verifier(
+                    verifier_root, row_name, case, repetition, baseline_hashes, canaries,
+                    canary_controls, validated_package.digest
                 )
                 staged.append(
                     StagedCase(
@@ -260,6 +258,139 @@ def stage_cases(
                 _remove_staged_directory(directory, parent, label)
         raise
     return staged
+
+
+def stage_benchmark_cases(
+    contract: SkillContract,
+    package: SkillPackage,
+    repetitions: int,
+    run_root: Path,
+    keep_workspaces_on_error: bool = False,
+) -> list[BenchmarkRow]:
+    """Stage paired control and treatment rows from identical fixture baselines."""
+    if not isinstance(repetitions, int) or isinstance(repetitions, bool) or repetitions < 1:
+        raise SkillEvalError("repetitions must be a positive integer")
+    if not isinstance(keep_workspaces_on_error, bool):
+        raise SkillEvalError("keep_workspaces_on_error must be a boolean")
+
+    eval_dir = _require_directory(contract.eval_dir, "eval directory")
+    validated_package = validate_skill_package(package.skill_dir)
+    if package.digest != validated_package.digest or package.runtime_files != validated_package.runtime_files:
+        raise SkillEvalError("skill package changed after validation")
+
+    resolved_run_root = _prepare_run_root(run_root)
+    _reject_nested_paths(resolved_run_root, eval_dir, "run root", "eval directory")
+    _reject_nested_paths(resolved_run_root, validated_package.skill_dir, "run root", "skill package")
+    workspace_root = _create_child_directory(resolved_run_root, "workspaces")
+    codex_root = _create_child_directory(resolved_run_root, "codex-homes")
+    verifier_root = _create_child_directory(resolved_run_root, "verifiers")
+
+    rows = []
+    created_directories: list[tuple[Path, Path, str]] = []
+    try:
+        for case in contract.cases:
+            _require_safe_case_id(case.case_id)
+            for repetition in range(1, repetitions + 1):
+                for arm in (BenchmarkArm.CONTROL, BenchmarkArm.TREATMENT):
+                    rows.append(
+                        _stage_benchmark_row(
+                            arm, case, repetition, contract, validated_package, eval_dir,
+                            workspace_root, codex_root, verifier_root, created_directories
+                        )
+                    )
+    except BaseException:
+        if not keep_workspaces_on_error:
+            for directory, parent, label in reversed(created_directories):
+                _remove_staged_directory(directory, parent, label)
+        raise
+    return rows
+
+
+def _stage_benchmark_row(
+    arm: BenchmarkArm,
+    case: SkillCase,
+    repetition: int,
+    contract: SkillContract,
+    package: SkillPackage,
+    eval_dir: Path,
+    workspace_root: Path,
+    codex_root: Path,
+    verifier_root: Path,
+    created_directories: list[tuple[Path, Path, str]],
+) -> BenchmarkRow:
+    row_name = f"{case.case_id}-{repetition}-{arm.value}"
+    workspace_dir, codex_home, baseline_hashes, canaries, canary_controls = _stage_workspace(
+        case, row_name, eval_dir, workspace_root, codex_root, created_directories
+    )
+    package_digest = None
+    if arm is BenchmarkArm.TREATMENT:
+        _install_runtime_skill(package, workspace_dir, contract.skill_name)
+        package_digest = package.digest
+    _write_verifier(
+        verifier_root, row_name, case, repetition, baseline_hashes, canaries,
+        canary_controls, package_digest, arm
+    )
+    return BenchmarkRow(
+        arm=arm,
+        case_id=case.case_id,
+        repetition=repetition,
+        workspace_dir=workspace_dir,
+        codex_home=codex_home,
+        case=case,
+        baseline_hashes=baseline_hashes,
+        skill_name=contract.skill_name,
+    )
+
+
+def _stage_workspace(
+    case: SkillCase,
+    row_name: str,
+    eval_dir: Path,
+    workspace_root: Path,
+    codex_root: Path,
+    created_directories: list[tuple[Path, Path, str]],
+) -> tuple[Path, Path, Mapping[str, str], Mapping[str, str], dict[str, Any]]:
+    """Create a fixture-derived workspace and its isolated canary controls."""
+    fixture = _validated_fixture_for_staging(case.fixture, eval_dir)
+    workspace_dir = _new_child_directory(workspace_root, row_name, "workspace")
+    created_directories.append((workspace_dir, workspace_root, "workspace"))
+    codex_home = _new_child_directory(codex_root, row_name, "CODEX_HOME")
+    created_directories.append((codex_home, codex_root, "CODEX_HOME"))
+    _copy_fixture(fixture, workspace_dir)
+    baseline_hashes = MappingProxyType(_hash_regular_files(workspace_dir))
+    _initialize_pristine_git_repository(workspace_dir)
+    canaries = MappingProxyType(_new_canaries(row_name))
+    canary_controls = _materialize_canary_controls(codex_home, canaries)
+    return workspace_dir, codex_home, baseline_hashes, canaries, canary_controls
+
+
+def _write_verifier(
+    verifier_root: Path,
+    row_name: str,
+    case: SkillCase,
+    repetition: int,
+    baseline_hashes: Mapping[str, str],
+    canaries: Mapping[str, str],
+    canary_controls: Mapping[str, Any],
+    package_digest: Optional[str],
+    arm: Optional[BenchmarkArm] = None,
+) -> None:
+    """Persist verifier inputs outside the staged workspace."""
+    verifier = {
+        "baseline_hashes": dict(baseline_hashes),
+        "canaries": dict(canaries),
+        "canary_controls": dict(canary_controls),
+        "case_id": case.case_id,
+        "package_digest": package_digest,
+        "repetition": repetition,
+        "sandbox": case.sandbox,
+    }
+    if arm is not None:
+        verifier["arm"] = arm.value
+    verifier_path = _new_child_file(verifier_root, f"{row_name}.json", "verifier configuration")
+    verifier_path.write_text(
+        json.dumps(verifier, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
 
 
 def parse_target(value: str, cfg: dict) -> TargetSpec:
