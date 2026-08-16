@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 import random
 import re
 import secrets
@@ -381,7 +382,7 @@ def _stage_benchmark_row(
     )
     verifier_path = verifier_root / f"{row_name}.json"
     verifier = json.loads(verifier_path.read_text(encoding="utf-8"))
-    verifier["staging_hashes"] = _hash_regular_files(workspace_dir)
+    verifier["staging_tree"] = _workspace_tree_snapshot(workspace_dir)
     verifier_path.write_text(json.dumps(verifier, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return BenchmarkRow(
         arm=arm,
@@ -792,7 +793,7 @@ def verify_benchmark_containment(rows: list[BenchmarkRow], raw_result: Mapping[s
             raise SkillEvalError("missing trace/verifier evidence")
         verifier = json.loads(verifier_path.read_text(encoding="utf-8"))
         actual_hashes = _hash_regular_files(row.workspace_dir)
-        if verifier.get("staging_hashes") != actual_hashes:
+        if verifier.get("staging_tree") != _workspace_tree_snapshot(row.workspace_dir):
             raise SkillEvalError("post-staging workspace mutation")
         baseline_hashes = verifier.get("baseline_hashes")
         if not isinstance(baseline_hashes, Mapping) or {
@@ -810,7 +811,7 @@ def verify_benchmark_containment(rows: list[BenchmarkRow], raw_result: Mapping[s
             raise SkillEvalError("canary leakage")
         trace_text = json.dumps(trace, ensure_ascii=False).lower()
         forbidden_commands = tuple(pattern.lower() for row_case in (row.case,) for pattern in row_case.expected.forbidden.get("command_patterns", ()))
-        if any(marker in trace_text for marker in ('"network": true', '"forbidden_command": true', 'web_search', 'network_access', 'shell_command', 'terminal.command', 'command_execution')) or any(pattern in trace_text for pattern in forbidden_commands):
+        if any(marker in trace_text for marker in ('"network": true', '"forbidden_command": true', 'web_search', 'network_access', 'shell_command', 'terminal.command', 'command_execution', 'codex.search.query', '"name": "search')) or any(pattern in trace_text for pattern in forbidden_commands):
             raise SkillEvalError("forbidden command/network")
         raw["_containment_safety"] = True
 
@@ -1179,6 +1180,24 @@ def _benchmark_promptfoo_test(
 def _fixture_digest(baseline_hashes: Mapping[str, str]) -> str:
     encoded = json.dumps(dict(baseline_hashes), sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _workspace_tree_snapshot(root: Path) -> dict[str, tuple[str, int, str]]:
+    """Capture lstat metadata without following links for post-staging containment."""
+    snapshot = {}
+    for entry in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+        relative = entry.relative_to(root).as_posix()
+        stat = entry.lstat()
+        mode = stat.st_mode & 0o7777
+        if entry.is_symlink():
+            snapshot[relative] = ["symlink", mode, os.readlink(entry)]
+        elif entry.is_dir():
+            snapshot[relative] = ["directory", mode, ""]
+        elif entry.is_file():
+            snapshot[relative] = ["file", mode, hashlib.sha256(entry.read_bytes()).hexdigest()]
+        else:
+            snapshot[relative] = ["other", mode, ""]
+    return snapshot
 
 
 def _benchmark_assertions(row: BenchmarkRow, judge_model: str) -> list[dict[str, str]]:

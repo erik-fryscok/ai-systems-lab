@@ -2292,7 +2292,7 @@ def cmd_skill_benchmark(args, cfg):
         skill_eval.validate_judge(target, args.judge_model)
         dependencies = require_skill_eval_dependencies()
         promptfoo_version = binary_version(dependencies["promptfoo"])
-        if promptfoo_version is not None and promptfoo_version != "0.122.0":
+        if promptfoo_version != "0.122.0":
             raise LabError("skill-benchmark requires Promptfoo 0.122.0")
         if target.kind == "local":
             model_files = model_weight_paths(cfg, target.alias)
