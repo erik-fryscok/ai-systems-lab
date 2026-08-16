@@ -838,6 +838,14 @@ class SkillBenchmarkSummaryTests(unittest.TestCase):
     def test_bootstrap_interval_is_seed_pinned(self):
         self.assertEqual(skill_eval.paired_bootstrap([0, 1, 1, -1], samples=100), [-0.63125, 1.0])
 
+    def test_task_score_is_independent_of_activation_and_row_success(self):
+        outcomes = skill_eval._assertion_outcomes([
+            {"type": "contains", "pass": True}, {"type": "skill-used", "pass": False},
+            {"type": "llm-rubric", "pass": True},
+        ], False, True)
+        self.assertEqual(outcomes["task"], 1)
+        self.assertEqual(outcomes["activation"], 0)
+
     def test_containment_verification_marks_every_row_safe(self):
         raw = self.raw_result()
         skill_eval.verify_benchmark_containment(self.rows, raw, self.root / "run")
@@ -910,6 +918,14 @@ class SkillBenchmarkSummaryTests(unittest.TestCase):
                 raw["results"][0]["trace"] = [{marker: True}]
                 with self.assertRaisesRegex(skill_eval.SkillEvalError, "forbidden command/network"):
                     skill_eval.verify_benchmark_containment(self.rows, raw, self.root / "run")
+
+    def test_containment_correlates_evaluation_trace_and_rejects_codex_command(self):
+        raw = self.raw_result()
+        raw["results"][0]["evaluationId"] = "eval-1"
+        raw["results"][0].pop("trace")
+        raw["traces"] = {"eval-1": {"spans": [{"attributes": {"codex.item.type": "command_execution", "codex.command": "curl example.invalid"}}]}}
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "forbidden command/network"):
+            skill_eval.verify_benchmark_containment(self.rows, raw, self.root / "run")
 
     def test_public_result_rejects_raw_answer_and_unknown_fields(self):
         for key, value in {

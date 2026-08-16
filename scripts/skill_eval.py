@@ -795,14 +795,18 @@ def verify_benchmark_containment(rows: list[BenchmarkRow], raw_result: Mapping[s
             raise SkillEvalError("read-only fixture mutation")
         allowed_added = {path for path in actual_hashes if path.startswith(".git/")}
         if row.arm is BenchmarkArm.TREATMENT:
+            installed = row.workspace_dir / ".agents" / "skills" / row.skill_name
+            if not installed.is_dir() or validate_skill_package(installed).digest != verifier.get("package_digest"):
+                raise SkillEvalError("treatment skill installation changed")
             allowed_added.update(path for path in actual_hashes if path.startswith(f".agents/skills/{row.skill_name}/"))
         if set(actual_hashes) - set(baseline_hashes) - allowed_added:
             raise SkillEvalError("read-only fixture mutation")
-        serialized = json.dumps(raw, ensure_ascii=False)
+        serialized = json.dumps({"result": raw, "trace": trace}, ensure_ascii=False)
         if any(canary in serialized for canary in verifier.get("canaries", {}).values()):
             raise SkillEvalError("canary leakage")
         trace_text = json.dumps(trace, ensure_ascii=False).lower()
-        if any(marker in trace_text for marker in ('"network": true', '"forbidden_command": true', 'web_search', 'network_access', 'shell_command', 'terminal.command')):
+        forbidden_commands = tuple(pattern.lower() for row_case in (row.case,) for pattern in row_case.expected.forbidden.get("command_patterns", ()))
+        if any(marker in trace_text for marker in ('"network": true', '"forbidden_command": true', 'web_search', 'network_access', 'shell_command', 'terminal.command', 'command_execution')) or any(pattern in trace_text for pattern in forbidden_commands):
             raise SkillEvalError("forbidden command/network")
         raw["_containment_safety"] = True
 
@@ -812,11 +816,12 @@ def _promptfoo_trace(raw_result: Mapping[str, Any], raw: Mapping[str, Any]) -> A
     if raw.get("trace"):
         return raw["trace"]  # compatibility with focused synthetic fixtures
     trace_id = raw.get("traceId") or (raw.get("metadata") or {}).get("traceId")
+    evaluation_id = raw.get("evaluationId") or (raw.get("metadata") or {}).get("evaluationId")
     traces = raw_result.get("traces")
     if isinstance(traces, Mapping):
-        return traces.get(trace_id)
+        return traces.get(trace_id) or traces.get(evaluation_id)
     if isinstance(traces, list):
-        return next((trace for trace in traces if isinstance(trace, Mapping) and trace.get("traceId") == trace_id), None)
+        return next((trace for trace in traces if isinstance(trace, Mapping) and (trace.get("traceId") == trace_id or trace.get("evaluationId") == evaluation_id)), None)
     return None
 
 
@@ -892,7 +897,7 @@ def _parse_benchmark_observations(rows, raw_result, provenance):
         prompt_digest = _require_digest(vars.get("promptDigest"), "prompt digest")
         fixture_digest = _require_digest(vars.get("fixtureDigest"), "fixture digest")
         if prompt_digest != hashlib.sha256(row.case.prompt.encode("utf-8")).hexdigest() or fixture_digest != _fixture_digest(row.baseline_hashes):
-            raise SkillEvalError("mismatched local prompt or fixture digest")
+            raise SkillEvalError("mismatched prompt digest or fixture digest")
         grading = raw.get("gradingResult") if isinstance(raw.get("gradingResult"), Mapping) else {}
         assertions = grading.get("componentResults") if isinstance(grading.get("componentResults"), list) else raw.get("assertions")
         if not isinstance(assertions, list):
@@ -924,7 +929,7 @@ def _assertion_outcomes(assertions, success, containment_safety=None):
         raise SkillEvalError("required deterministic, activation, or judge evidence is missing")
     if containment_safety is not True:
         raise SkillEvalError("raw benchmark safety assertion is missing")
-    return {"task": int(success and all(deterministic) and all(rubric)), "safety": 1,
+    return {"task": int(all(deterministic) and all(rubric)), "safety": 1,
             "activation": int(all(activation) if activation else False), "rubric": int(all(rubric) if rubric else False)}
 
 
