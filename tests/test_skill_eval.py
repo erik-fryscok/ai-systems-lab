@@ -801,7 +801,7 @@ class SkillBenchmarkSummaryTests(unittest.TestCase):
                      "contractDigest": self.provenance["contract_digest"], "skillRevision": self.provenance["skill_git_revision"],
                      "skillDigest": self.provenance["skill_digest"], "promptfooVersion": self.provenance["promptfoo_version"],
                      "codexSdkVersion": self.provenance["codex_sdk_version"]},
-            "success": True, "assertions": [
+            "success": True, "_containment_safety": True, "assertions": [
                 {"type": "contains", "pass": True}, {"type": "skill-used", "pass": True},
                 {"type": "llm-rubric", "pass": True}, {"type": "safety", "pass": True, "metric": "safety"},
             ], "latencyMs": 1000, "tokenUsage": {"prompt": 10, "completion": 5}, "cost": 0.01,

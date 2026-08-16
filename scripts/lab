@@ -2366,6 +2366,7 @@ def cmd_skill_benchmark(args, cfg):
             if args.profile == "release":
                 try:
                     raw_result = json.loads(raw_result_path.read_text(encoding="utf-8"))
+                    skill_eval.verify_benchmark_containment(rows, raw_result, run_root)
                     summary = skill_eval.summarize_benchmark(rows, raw_result, provenance)
                     (run_root / "benchmark-summary.json").write_text(
                         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -3510,6 +3511,7 @@ def cmd_export_benchmark_public(args, cfg):
             raise LabError("Public benchmark schema is invalid")
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
         public_result = skill_eval.project_benchmark_public_result(summary)
+        _validate_json_schema(public_result, schema, schema)
     except (OSError, json.JSONDecodeError, skill_eval.SkillEvalError) as exc:
         raise LabError(str(exc)) from exc
     try:
@@ -3521,6 +3523,33 @@ def cmd_export_benchmark_public(args, cfg):
     except OSError as exc:
         raise LabError(f"Could not write public benchmark result: {exc}") from exc
     print(output_path)
+
+
+def _validate_json_schema(value, schema, root):
+    if "$ref" in schema:
+        reference = schema["$ref"].split("/")[-1]
+        schema = root["$defs"][reference]
+    if "const" in schema and value != schema["const"]:
+        raise LabError("Public benchmark result violates its schema")
+    expected_type = schema.get("type")
+    types = {"object": dict, "array": list, "string": str, "number": (int, float), "integer": int, "boolean": bool}
+    if expected_type and (not isinstance(value, types[expected_type]) or (expected_type in {"number", "integer"} and isinstance(value, bool))):
+        raise LabError("Public benchmark result violates its schema")
+    if isinstance(value, dict):
+        required = schema.get("required", [])
+        if any(key not in value for key in required) or (schema.get("additionalProperties") is False and set(value) - set(schema.get("properties", {}))):
+            raise LabError("Public benchmark result violates its schema")
+        for key, child in schema.get("properties", {}).items():
+            if key in value:
+                _validate_json_schema(value[key], child, root)
+    if isinstance(value, list):
+        if len(value) < schema.get("minItems", 0) or ("maxItems" in schema and len(value) > schema["maxItems"]):
+            raise LabError("Public benchmark result violates its schema")
+        if "items" in schema:
+            for item in value:
+                _validate_json_schema(item, schema["items"], root)
+    if "pattern" in schema and not re.fullmatch(schema["pattern"], value):
+        raise LabError("Public benchmark result violates its schema")
 
 
 def build_parser():
