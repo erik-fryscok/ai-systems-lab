@@ -2291,6 +2291,8 @@ def cmd_skill_benchmark(args, cfg):
         target = skill_eval.parse_target(args.target, cfg)
         skill_eval.validate_judge(target, args.judge_model)
         dependencies = require_skill_eval_dependencies()
+        if binary_version(dependencies["promptfoo"]) != "0.122.0":
+            raise LabError("skill-benchmark requires Promptfoo 0.122.0")
         if target.kind == "local":
             model_files = model_weight_paths(cfg, target.alias)
             missing = [path for path in model_files if not path.exists()]
@@ -2312,6 +2314,8 @@ def cmd_skill_benchmark(args, cfg):
         verify_skill_benchmark_revision(skill_dir)
         eval_dir = Path(args.eval_dir).expanduser() if args.eval_dir else None
         contract = skill_eval.load_skill_contract(skill_dir, eval_dir)
+        if contract.skill_name != "github-public-readiness":
+            raise LabError("skill-benchmark requires the github-public-readiness skill")
         package = skill_eval.validate_skill_package(skill_dir)
         target_digest = hashlib.sha256(
             f"{target.kind}:{target.model}".encode("utf-8")
