@@ -885,7 +885,7 @@ class SkillBenchmarkSummaryTests(unittest.TestCase):
 
     def test_containment_rejects_baseline_mutation(self):
         (self.rows[0].workspace_dir / "README.md").write_text("changed\n", encoding="utf-8")
-        with self.assertRaisesRegex(skill_eval.SkillEvalError, "non-regular entry"):
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "post-staging workspace mutation"):
             skill_eval.verify_benchmark_containment(self.rows, self.raw_result(), self.root / "run")
 
     def test_containment_rejects_added_workspace_file(self):
