@@ -512,6 +512,16 @@ class InferenceProviderTests(unittest.TestCase):
 
 
 class SkillEvalCommandTests(unittest.TestCase):
+    def test_skill_benchmark_rejects_promptfoo_version_mismatch(self):
+        with mock.patch.object(lab, "require_skill_eval_dependencies", return_value={"promptfoo": "/promptfoo"}), mock.patch.object(lab, "binary_version", return_value="0.121.0"):
+            with self.assertRaisesRegex(lab.LabError, "Promptfoo 0.122.0"):
+                lab.cmd_skill_benchmark(self.command_args(target="openai:gpt-5.6-terra", judge_model="gpt-5.6", profile="release"), self.config)
+
+    def test_skill_benchmark_rejects_non_public_skill(self):
+        with mock.patch.object(lab, "require_skill_eval_dependencies", return_value={"promptfoo": "/promptfoo"}), mock.patch.object(lab, "binary_version", return_value="0.122.0"), mock.patch.object(lab, "verify_skill_benchmark_revision"):
+            with self.assertRaisesRegex(lab.LabError, "github-public-readiness"):
+                lab.cmd_skill_benchmark(self.command_args(target="openai:gpt-5.6-terra", judge_model="gpt-5.6", profile="release"), self.config)
+
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
@@ -586,11 +596,127 @@ class SkillEvalCommandTests(unittest.TestCase):
                 "deep",
             ]
         )
+        benchmark_args = lab.build_parser().parse_args(
+            [
+                "skill-benchmark",
+                "skill-dir",
+                "--target",
+                "openai:gpt-5.6-terra",
+                "--judge-model",
+                "gpt-5.6",
+                "--profile",
+                "release",
+            ]
+        )
 
         self.assertEqual(eval_args.profile, "smoke")
         self.assertEqual(eval_args.timeout, 900)
         self.assertFalse(eval_args.keep_workspaces)
         self.assertEqual(redteam_args.profile, "deep")
+        self.assertEqual(benchmark_args.profile, "release")
+        self.assertEqual(benchmark_args.timeout, 900)
+        self.assertFalse(benchmark_args.keep_workspaces)
+
+    def test_successful_cloud_benchmark_skips_local_lifecycle_cleans_paired_staging_and_hides_raw_path(self):
+        output = io.StringIO()
+        with mock.patch.object(
+            lab, "require_skill_eval_dependencies", return_value={"promptfoo": "/promptfoo"}
+        ), mock.patch.object(
+            lab, "binary_version", return_value="0.122.0"
+        ), mock.patch.object(
+            lab, "verify_skill_benchmark_revision"
+        ) as verify_revision, mock.patch.object(
+            lab, "verify_responses_endpoint"
+        ) as verify_responses, mock.patch.object(
+            lab, "benchmark_model_session"
+        ) as benchmark_session, mock.patch.object(
+            lab.skill_eval, "run_promptfoo"
+        ) as run_promptfoo, mock.patch.object(
+            lab.skill_eval, "validate_benchmark_matrix", create=True
+        ), redirect_stdout(output):
+            lab.cmd_skill_benchmark(
+                self.command_args(target="openai:gpt-5.6-terra", judge_model="gpt-5.6"),
+                self.config,
+            )
+
+        run_root = run_promptfoo.call_args.args[1].parent
+        verify_revision.assert_called_once_with(self.skill_dir)
+        verify_responses.assert_not_called()
+        benchmark_session.assert_not_called()
+        self.assertEqual(list((run_root / "workspaces").iterdir()), [])
+        self.assertEqual(list((run_root / "codex-homes").iterdir()), [])
+        self.assertEqual(output.getvalue(), f"{run_root}\n")
+
+    def test_skill_benchmark_rejects_any_candidate_or_judge_other_than_the_preregistered_models(self):
+        with mock.patch.object(lab, "require_skill_eval_dependencies") as dependencies:
+            with self.assertRaisesRegex(lab.LabError, "openai:gpt-5.6-terra"):
+                lab.cmd_skill_benchmark(
+                    self.command_args(target="openai:gpt-5.6", judge_model="gpt-5.6"),
+                    self.config,
+                )
+            with self.assertRaisesRegex(lab.LabError, "gpt-5.6"):
+                lab.cmd_skill_benchmark(
+                    self.command_args(target="openai:gpt-5.6-terra", judge_model="gpt-5.6-mini"),
+                    self.config,
+                )
+
+        dependencies.assert_not_called()
+
+    def test_skill_benchmark_rejects_a_staged_non_nine_case_matrix_before_configuration(self):
+        with mock.patch.object(
+            lab, "require_skill_eval_dependencies", return_value={"promptfoo": "/promptfoo"}
+        ), mock.patch.object(
+            lab, "binary_version", return_value="0.122.0"
+        ), mock.patch.object(
+            lab, "verify_skill_benchmark_revision"
+        ), mock.patch.object(
+            lab.skill_eval, "build_benchmark_promptfoo_config"
+        ) as build_config, mock.patch.object(lab.skill_eval, "run_promptfoo"):
+            with self.assertRaisesRegex(lab.LabError, "18 rows"):
+                lab.cmd_skill_benchmark(
+                    self.command_args(target="openai:gpt-5.6-terra", judge_model="gpt-5.6"),
+                    self.config,
+                )
+
+        build_config.assert_not_called()
+
+    def test_skill_benchmark_promptfoo_failure_hides_private_paths_from_stderr(self):
+        (self.root / "models").mkdir()
+        args = self.command_args(target="openai:gpt-5.6-terra", judge_model="gpt-5.6")
+        args.command = "skill-benchmark"
+        args.config = "private-config.json"
+        parser = mock.Mock()
+        parser.parse_args.return_value = args
+        stderr = io.StringIO()
+
+        def promptfoo_failure(_binary, config_path, raw_result_path, _timeout):
+            raise subprocess.CalledProcessError(
+                7,
+                ["/private/promptfoo", "eval", "--config", str(config_path), "--output", str(raw_result_path)],
+            )
+
+        with mock.patch.object(lab, "build_parser", return_value=parser), mock.patch.object(
+            lab, "load_config", return_value=self.config
+        ), mock.patch.object(
+            lab, "require_skill_eval_dependencies", return_value={"promptfoo": "/private/promptfoo"}
+        ), mock.patch.object(
+            lab, "binary_version", return_value="0.122.0"
+        ), mock.patch.object(
+            lab, "verify_skill_benchmark_revision"
+        ), mock.patch.object(
+            lab.skill_eval, "validate_benchmark_matrix"
+        ), mock.patch.object(
+            lab.skill_eval, "build_benchmark_promptfoo_config"
+        ), mock.patch.object(
+            lab.skill_eval, "run_promptfoo", side_effect=promptfoo_failure
+        ), redirect_stderr(stderr):
+            status = lab.main()
+
+        self.assertEqual(status, 1)
+        self.assertEqual(stderr.getvalue(), "error: Skill benchmark execution failed with exit 7.\n")
+        self.assertNotIn("/private", stderr.getvalue())
+        self.assertNotIn("promptfooconfig.yaml", stderr.getvalue())
+        self.assertNotIn("promptfoo.json", stderr.getvalue())
 
     def test_skill_eval_rejects_an_invalid_target_before_dependency_or_inference_checks(self):
         args = Namespace(
@@ -1732,6 +1858,12 @@ class GatewayTests(unittest.TestCase):
 
 
 class PublicExportTests(unittest.TestCase):
+    def test_loaded_public_schema_rejects_invalid_nested_metric(self):
+        schema = json.loads((REPO_ROOT / "docs" / "benchmark-results" / "github-public-readiness-benchmark.schema.json").read_text())
+        payload = {"metrics": {"control": {"task_pass_rate": "not-a-number"}}}
+        with self.assertRaisesRegex(lab.LabError, "violates its schema"):
+            lab._validate_json_schema(payload, {"type": "object", "properties": {"metrics": {"$ref": "#/$defs/metrics"}}}, schema)
+
     def test_sanitize_public_value_drops_answers_and_local_metadata(self):
         source = {
             "repo": "/Users/example/private",
@@ -1782,6 +1914,29 @@ class PublicExportTests(unittest.TestCase):
         row = exported["artifacts"]["results.jsonl"][0]
         self.assertEqual(row, {"model": "fast-9b", "latency_seconds": 1.2})
         self.assertNotIn("repo", exported["artifacts"]["metadata.json"])
+
+    def test_export_benchmark_public_projects_only_the_strict_aggregate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_dir = root / "private-run"
+            run_dir.mkdir()
+            private = {
+                "schema_version": 1, "benchmark_id": "github-public-readiness-paired-v1",
+                "provenance": {"candidate": "openai:gpt-5.6-terra", "judge": "gpt-5.6", "skill_git_revision": "4480393", "skill_digest": "a" * 64, "contract_digest": "b" * 64, "promptfoo_version": "0.122.0", "codex_sdk_version": "0.147.0"},
+                "run": {"profile": "release", "cases": 9, "arms": 2, "repetitions": 5, "valid_pairs": 45},
+                "metrics": {"control": {"task_pass_rate": 1, "task_passes": 1, "task_total": 1, "safety_pass_rate": 1, "safety_passes": 1, "safety_total": 1, "median_latency_seconds": 1, "latency_range_seconds": [1, 1], "input_tokens": 1, "output_tokens": 1, "estimated_cost_usd": 0}, "treatment": {"task_pass_rate": 1, "task_passes": 1, "task_total": 1, "safety_pass_rate": 1, "safety_passes": 1, "safety_total": 1, "activation_accuracy": 1, "median_latency_seconds": 1, "latency_range_seconds": [1, 1], "input_tokens": 1, "output_tokens": 1, "estimated_cost_usd": 0}, "paired_deltas": {"task_pass_rate": {"value": 0, "ci95": [0, 0]}, "safety_pass_rate": {"value": 0, "ci95": [0, 0]}}},
+                "case_results": [], "limitations": ["Synthetic repositories bound the result to the authored cases."],
+                "privacy_review": {"automated_export_validation": True, "manual_review": True},
+                "raw_answer": "must not be exported",
+            }
+            (run_dir / "benchmark-summary.json").write_text(json.dumps(private), encoding="utf-8")
+            output = root / "public.json"
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                lab.cmd_export_benchmark_public(Namespace(run_dir=str(run_dir), output=str(output)), {})
+            self.assertEqual(stdout.getvalue(), f"{output.resolve()}\n")
+            exported = json.loads(output.read_text(encoding="utf-8"))
+            self.assertNotIn("raw_answer", exported)
 
 
 if __name__ == "__main__":

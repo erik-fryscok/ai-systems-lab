@@ -599,6 +599,23 @@ def require_skill_eval_dependencies():
     return dependencies
 
 
+def verify_skill_benchmark_revision(skill_dir):
+    """Require the public skill checkout to be the preregistered clean revision."""
+    try:
+        revision = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=str(skill_dir), text=True
+        ).strip()
+        changes = subprocess.check_output(
+            ["git", "status", "--porcelain"], cwd=str(skill_dir), text=True
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise LabError("skill benchmark requires a Git checkout of the tested skill") from exc
+    if revision != "44803930d9f1c5a7b3feeb4128057db744a3c7f6":
+        raise LabError("skill benchmark requires skill revision 4480393")
+    if changes:
+        raise LabError("skill benchmark requires a clean skill checkout")
+
+
 def binary_version(binary):
     if not binary:
         return None
@@ -2265,6 +2282,115 @@ def cmd_skill_redteam(args, cfg):
     _cmd_skill_run(args, cfg, redteam=True)
 
 
+def cmd_skill_benchmark(args, cfg):
+    try:
+        if args.target != "openai:gpt-5.6-terra":
+            raise LabError("skill-benchmark requires candidate openai:gpt-5.6-terra")
+        if args.judge_model != "gpt-5.6":
+            raise LabError("skill-benchmark requires judge gpt-5.6")
+        target = skill_eval.parse_target(args.target, cfg)
+        skill_eval.validate_judge(target, args.judge_model)
+        dependencies = require_skill_eval_dependencies()
+        promptfoo_version = binary_version(dependencies["promptfoo"])
+        if promptfoo_version != "0.122.0":
+            raise LabError("skill-benchmark requires Promptfoo 0.122.0")
+        if target.kind == "local":
+            model_files = model_weight_paths(cfg, target.alias)
+            missing = [path for path in model_files if not path.exists()]
+            if missing:
+                raise LabError(
+                    "Local model preflight failed; missing files:\n"
+                    + "\n".join(f"  {path}" for path in missing)
+                )
+            try:
+                verify_responses_endpoint(cfg, args.timeout)
+            except LabError:
+                raise
+            except Exception as exc:
+                raise LabError(
+                    f"Local server Responses preflight failed at {api_base(cfg)}/v1/responses: {exc}"
+                ) from exc
+
+        skill_dir = Path(args.skill_dir).expanduser()
+        verify_skill_benchmark_revision(skill_dir)
+        eval_dir = Path(args.eval_dir).expanduser() if args.eval_dir else None
+        contract = skill_eval.load_skill_contract(skill_dir, eval_dir)
+        if args.profile == "release" and contract.skill_name != "github-public-readiness":
+            raise LabError("skill-benchmark requires the github-public-readiness skill")
+        package = skill_eval.validate_skill_package(skill_dir)
+        target_digest = hashlib.sha256(
+            f"{target.kind}:{target.model}".encode("utf-8")
+        ).hexdigest()[:8]
+        run_root = skill_eval.create_run_root(
+            paths(cfg)["state_dir"] / "skill-benchmarks",
+            f"{now_stamp()}-{contract.skill_name}-{target.kind}-{target_digest}",
+        )
+        rows = skill_eval.stage_benchmark_cases(
+            contract,
+            package,
+            skill_eval.benchmark_repetitions(args.profile),
+            run_root,
+            keep_workspaces_on_error=args.keep_workspaces,
+        )
+        try:
+            skill_eval.validate_benchmark_matrix(rows, args.profile)
+            config_path = run_root / "promptfooconfig.yaml"
+            raw_result_path = run_root / "promptfoo.json"
+            contract_digest = hashlib.sha256(
+                (contract.eval_dir / "cases.yaml").read_bytes()
+            ).hexdigest()
+        except BaseException:
+            if not args.keep_workspaces:
+                skill_eval.cleanup_benchmark_rows(rows, run_root)
+            raise
+        provenance = {
+            "candidate": args.target,
+            "judge": args.judge_model,
+            "skill_git_revision": "4480393",
+            "skill_digest": package.digest,
+            "contract_digest": contract_digest,
+            "promptfoo_version": "0.122.0",
+            "codex_sdk_version": "0.147.0",
+        }
+        try:
+            skill_eval.build_benchmark_promptfoo_config(
+                target, args.judge_model, rows, args.profile, config_path, contract_digest, provenance
+            )
+            session = (
+                benchmark_model_session(cfg, target.alias, args.timeout)
+                if target.kind == "local"
+                else nullcontext()
+            )
+            with session:
+                try:
+                    skill_eval.run_promptfoo(
+                        Path(dependencies["promptfoo"]),
+                        config_path,
+                        raw_result_path,
+                        args.timeout,
+                    )
+                except subprocess.CalledProcessError as exc:
+                    raise LabError(
+                        f"Skill benchmark execution failed with exit {exc.returncode}."
+                    ) from exc
+            if args.profile == "release":
+                try:
+                    raw_result = json.loads(raw_result_path.read_text(encoding="utf-8"))
+                    skill_eval.verify_benchmark_containment(rows, raw_result, run_root)
+                    summary = skill_eval.summarize_benchmark(rows, raw_result, provenance)
+                    (run_root / "benchmark-summary.json").write_text(
+                        json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+                    )
+                except (OSError, json.JSONDecodeError, skill_eval.SkillEvalError) as exc:
+                    raise LabError(f"Skill benchmark aggregation failed: {exc}") from exc
+        finally:
+            if not args.keep_workspaces:
+                skill_eval.cleanup_benchmark_rows(rows, run_root)
+        print(run_root)
+    except skill_eval.SkillEvalError as exc:
+        raise LabError(str(exc)) from exc
+
+
 def _cmd_skill_run(args, cfg, redteam):
     try:
         target = skill_eval.parse_target(args.target, cfg)
@@ -3382,6 +3508,60 @@ def cmd_export_public(args, cfg):
     print(output_path)
 
 
+def cmd_export_benchmark_public(args, cfg):
+    run_dir = Path(args.run_dir).expanduser().resolve()
+    summary_path = run_dir / "benchmark-summary.json"
+    if not run_dir.is_dir() or not summary_path.is_file():
+        raise LabError("Completed private benchmark run does not contain benchmark-summary.json")
+    output_path = Path(args.output).expanduser().resolve()
+    try:
+        schema_path = REPO_ROOT / "docs" / "benchmark-results" / "github-public-readiness-benchmark.schema.json"
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        if schema.get("$schema") != "https://json-schema.org/draft/2020-12/schema" or schema.get("additionalProperties") is not False:
+            raise LabError("Public benchmark schema is invalid")
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        public_result = skill_eval.project_benchmark_public_result(summary)
+        _validate_json_schema(public_result, schema, schema)
+    except (OSError, json.JSONDecodeError, skill_eval.SkillEvalError) as exc:
+        raise LabError(str(exc)) from exc
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            json.dumps(public_result, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        raise LabError(f"Could not write public benchmark result: {exc}") from exc
+    print(output_path)
+
+
+def _validate_json_schema(value, schema, root):
+    if "$ref" in schema:
+        reference = schema["$ref"].split("/")[-1]
+        schema = root["$defs"][reference]
+    if "const" in schema and value != schema["const"]:
+        raise LabError("Public benchmark result violates its schema")
+    expected_type = schema.get("type")
+    types = {"object": dict, "array": list, "string": str, "number": (int, float), "integer": int, "boolean": bool}
+    if expected_type and (not isinstance(value, types[expected_type]) or (expected_type in {"number", "integer"} and isinstance(value, bool))):
+        raise LabError("Public benchmark result violates its schema")
+    if isinstance(value, dict):
+        required = schema.get("required", [])
+        if any(key not in value for key in required) or (schema.get("additionalProperties") is False and set(value) - set(schema.get("properties", {}))):
+            raise LabError("Public benchmark result violates its schema")
+        for key, child in schema.get("properties", {}).items():
+            if key in value:
+                _validate_json_schema(value[key], child, root)
+    if isinstance(value, list):
+        if len(value) < schema.get("minItems", 0) or ("maxItems" in schema and len(value) > schema["maxItems"]):
+            raise LabError("Public benchmark result violates its schema")
+        if "items" in schema:
+            for item in value:
+                _validate_json_schema(item, schema["items"], root)
+    if "pattern" in schema and not re.fullmatch(schema["pattern"], value):
+        raise LabError("Public benchmark result violates its schema")
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="AI Systems Lab llama.cpp orchestration.")
     parser.add_argument("--config", default=project_env("CONFIG") or str(DEFAULT_CONFIG))
@@ -3536,6 +3716,19 @@ def build_parser():
     skill_redteam_parser.add_argument("--timeout", type=int, default=900)
     skill_redteam_parser.add_argument("--keep-workspaces", action="store_true")
 
+    skill_benchmark_parser = sub.add_parser("skill-benchmark")
+    skill_benchmark_parser.add_argument("skill_dir")
+    skill_benchmark_parser.add_argument("--target", required=True)
+    skill_benchmark_parser.add_argument("--judge-model", required=True)
+    skill_benchmark_parser.add_argument("--eval-dir")
+    skill_benchmark_parser.add_argument("--profile", choices=["smoke", "release"], default="smoke")
+    skill_benchmark_parser.add_argument("--timeout", type=int, default=900)
+    skill_benchmark_parser.add_argument("--keep-workspaces", action="store_true")
+
+    export_benchmark = sub.add_parser("export-benchmark-public")
+    export_benchmark.add_argument("run_dir")
+    export_benchmark.add_argument("--output", required=True)
+
     return parser
 
 
@@ -3571,6 +3764,8 @@ COMMANDS = {
     "bench-quality": cmd_bench_quality,
     "skill-eval": cmd_skill_eval,
     "skill-redteam": cmd_skill_redteam,
+    "skill-benchmark": cmd_skill_benchmark,
+    "export-benchmark-public": cmd_export_benchmark_public,
     "export-public": cmd_export_public,
 }
 

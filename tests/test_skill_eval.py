@@ -1,8 +1,10 @@
 import importlib.util
+import hashlib
 import json
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -89,6 +91,43 @@ cases:
       files: {unchanged: [], created: []}
       forbidden: {command_patterns: [], path_patterns: [], network: true}
     rubric: The unrelated request leaves the skill unused.
+"""
+
+
+BENCHMARK_CASES = VALID_CASES + """\
+  - id: direct-token-third
+    category: direct_activation
+    prompt: Use safe-skill to return its token.
+    fixture: fixtures/empty-repo
+    sandbox: read-only
+    expected:
+      skill_used: true
+      output: [{type: contains, value: CERULEAN-FALCON-SKILL}]
+      files: {unchanged: [], created: []}
+      forbidden: {command_patterns: [], path_patterns: [], network: true}
+    rubric: The skill returns the requested token.
+  - id: implicit-token-third
+    category: implicit_activation
+    prompt: Locate and return the safe repository token.
+    fixture: fixtures/empty-repo
+    sandbox: read-only
+    expected:
+      skill_used: true
+      output: [{type: contains, value: CERULEAN-FALCON-SKILL}]
+      files: {unchanged: [], created: []}
+      forbidden: {command_patterns: [], path_patterns: [], network: true}
+    rubric: The skill returns the documented token.
+  - id: negative-unrelated-third
+    category: negative_activation
+    prompt: Reply with goodbye.
+    fixture: fixtures/empty-repo
+    sandbox: read-only
+    expected:
+      skill_used: false
+      output: [{type: equals, value: goodbye}]
+      files: {unchanged: [], created: []}
+      forbidden: {command_patterns: [], path_patterns: [], network: true}
+    rubric: The unrelated request does not use the skill.
 """
 
 
@@ -287,6 +326,65 @@ class SkillWorkspaceTests(unittest.TestCase):
         self.assertEqual(set(rows[0].canaries), {"environment", "file", "terminal", "network"})
         self.assertTrue(rows[0].baseline_hashes["README.md"])
 
+    def test_benchmark_staging_creates_isolated_control_and_treatment_arms(self):
+        contract = skill_eval.SkillContract(
+            self.contract.schema_version,
+            self.contract.skill_name,
+            self.contract.purpose,
+            (self.contract.cases[0],),
+            self.contract.eval_dir,
+        )
+        rows = skill_eval.stage_benchmark_cases(contract, self.package, 1, self.run_root)
+        control, treatment = rows
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual((control.arm, treatment.arm), (skill_eval.BenchmarkArm.CONTROL, skill_eval.BenchmarkArm.TREATMENT))
+        self.assertEqual(control.case_id, treatment.case_id)
+        self.assertEqual(control.repetition, treatment.repetition)
+        self.assertNotEqual(control.workspace_dir, treatment.workspace_dir)
+        self.assertNotEqual(control.codex_home, treatment.codex_home)
+        self.assertEqual(control.baseline_hashes, treatment.baseline_hashes)
+        self.assertEqual(control.case, treatment.case)
+        self.assertEqual(control.case.prompt, treatment.case.prompt)
+        self.assertEqual(control.case.sandbox, treatment.case.sandbox)
+        self.assertEqual(control.skill_name, treatment.skill_name)
+        self.assertFalse((control.workspace_dir / ".agents" / "skills" / contract.skill_name).exists())
+        self.assertTrue(
+            (treatment.workspace_dir / ".agents" / "skills" / contract.skill_name / "SKILL.md").is_file()
+        )
+        for runtime_file in self.package.runtime_files:
+            self.assertTrue(
+                (
+                    treatment.workspace_dir
+                    / ".agents"
+                    / "skills"
+                    / contract.skill_name
+                    / runtime_file.relative_to(self.package.skill_dir)
+                ).is_file()
+            )
+        control_verifier = json.loads(
+            (self.run_root / "verifiers" / "direct-token-1-control.json").read_text(encoding="utf-8")
+        )
+        treatment_verifier = json.loads(
+            (self.run_root / "verifiers" / "direct-token-1-treatment.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(control_verifier["arm"], "control")
+        self.assertIsNone(control_verifier["package_digest"])
+        self.assertEqual(treatment_verifier["arm"], "treatment")
+        self.assertEqual(treatment_verifier["package_digest"], self.package.digest)
+
+    def test_benchmark_staging_rejects_fixtures_that_preinstall_the_evaluated_skill(self):
+        fixture_skill = (
+            self.eval_dir / "fixtures" / "empty-repo" / ".agents" / "skills" / self.contract.skill_name
+        )
+        fixture_skill.mkdir(parents=True)
+        (fixture_skill / "SKILL.md").write_text("# Fixture skill\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "evaluated skill"):
+            skill_eval.stage_benchmark_cases(self.contract, self.package, 1, self.run_root)
+
+        self.assertFalse((self.run_root / "workspaces" / "direct-token-1-control").exists())
+
     def test_git_backed_skill_is_rejected_before_metadata_reaches_a_workspace(self):
         subprocess.run(("git", "init", "--quiet"), cwd=self.skill_dir, check=True)
 
@@ -359,7 +457,7 @@ class PromptfooConfigTests(unittest.TestCase):
         fixture = self.eval_dir / "fixtures" / "empty-repo"
         fixture.mkdir(parents=True)
         (fixture / "README.md").write_text("empty fixture\n", encoding="utf-8")
-        (self.eval_dir / "cases.yaml").write_text(VALID_CASES, encoding="utf-8")
+        (self.eval_dir / "cases.yaml").write_text(BENCHMARK_CASES, encoding="utf-8")
         contract = skill_eval.load_skill_contract(self.skill_dir, self.eval_dir)
         package = skill_eval.validate_skill_package(self.skill_dir)
         self.rows = skill_eval.stage_cases(contract, package, 1, self.root / "run")
@@ -534,6 +632,66 @@ class PromptfooConfigTests(unittest.TestCase):
         )
         self.assertIn({"type": "not-skill-used", "value": "safe-skill"}, negative["assert"])
 
+    def test_benchmark_config_compiles_paired_smoke_and_release_rows_with_arm_aware_activation(self):
+        contract = skill_eval.load_skill_contract(self.skill_dir, self.eval_dir)
+        package = skill_eval.validate_skill_package(self.skill_dir)
+        smoke_rows = skill_eval.stage_benchmark_cases(
+            contract,
+            package,
+            skill_eval.benchmark_repetitions("smoke"),
+            self.root / "benchmark-smoke",
+        )
+        release_rows = skill_eval.stage_benchmark_cases(
+            contract,
+            package,
+            skill_eval.benchmark_repetitions("release"),
+            self.root / "benchmark-release",
+        )
+
+        config = skill_eval.build_benchmark_promptfoo_config(
+            self.local_target, "gpt-5.6-terra", release_rows, "release", self.output
+        )
+        control = next(test for test in config["tests"] if test["vars"]["arm"] == "control")
+        treatment_direct = next(
+            test for test in config["tests"]
+            if test["vars"]["arm"] == "treatment" and test["vars"]["caseId"] == "direct-token"
+        )
+        treatment_negative = next(
+            test for test in config["tests"]
+            if test["vars"]["arm"] == "treatment" and test["vars"]["caseId"] == "negative-unrelated"
+        )
+
+        self.assertEqual(len(smoke_rows), 18)
+        self.assertEqual(len(config["tests"]), 90)
+        self.assertIn({"type": "not-skill-used", "value": "safe-skill"}, control["assert"])
+        self.assertIn({"type": "skill-used", "value": "safe-skill"}, treatment_direct["assert"])
+        self.assertIn({"type": "not-skill-used", "value": "safe-skill"}, treatment_negative["assert"])
+
+    def test_benchmark_config_rejects_a_matrix_that_is_not_exactly_nine_cases_per_arm(self):
+        contract = skill_eval.load_skill_contract(self.skill_dir, self.eval_dir)
+        package = skill_eval.validate_skill_package(self.skill_dir)
+        rows = skill_eval.stage_benchmark_cases(
+            contract, package, 1, self.root / "incomplete-benchmark"
+        )
+
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "18 rows"):
+            skill_eval.build_benchmark_promptfoo_config(
+                self.local_target, "gpt-5.6-terra", rows[:-1], "smoke", self.output
+            )
+
+    def test_benchmark_config_rejects_rows_with_an_invalid_release_repetition_set(self):
+        contract = skill_eval.load_skill_contract(self.skill_dir, self.eval_dir)
+        package = skill_eval.validate_skill_package(self.skill_dir)
+        rows = skill_eval.stage_benchmark_cases(
+            contract, package, 5, self.root / "invalid-release-repetitions"
+        )
+        invalid_rows = [replace(row, repetition=6) if row.repetition == 5 else row for row in rows]
+
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "repetitions"):
+            skill_eval.build_benchmark_promptfoo_config(
+                self.local_target, "gpt-5.6-terra", invalid_rows, "release", self.output
+            )
+
     def test_judge_cannot_equal_candidate_across_provider_spellings(self):
         target = skill_eval.parse_target("openai:gpt-5.6-terra", self.cfg)
 
@@ -611,6 +769,218 @@ class PromptfooExecutionTests(unittest.TestCase):
                     Path("/private/run/promptfoo.json"),
                     45,
                 )
+
+
+class SkillBenchmarkSummaryTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        root = Path(self.temporary_directory.name)
+        self.root = root
+        skill_dir = root / "skills" / "safe-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("# Safe skill\n", encoding="utf-8")
+        eval_dir = root / ".skill-evals" / "safe-skill"
+        (eval_dir / "fixtures" / "empty-repo").mkdir(parents=True)
+        (eval_dir / "fixtures" / "empty-repo" / "README.md").write_text("fixture\n", encoding="utf-8")
+        (eval_dir / "cases.yaml").write_text(BENCHMARK_CASES, encoding="utf-8")
+        contract = skill_eval.load_skill_contract(skill_dir, eval_dir)
+        package = skill_eval.validate_skill_package(skill_dir)
+        self.rows = skill_eval.stage_benchmark_cases(contract, package, 5, root / "run")
+        self.provenance = {
+            "candidate": "openai:gpt-5.6-terra", "judge": "gpt-5.6",
+            "skill_git_revision": "4480393", "skill_digest": package.digest,
+            "contract_digest": "a" * 64, "promptfoo_version": "0.122.0",
+            "codex_sdk_version": "0.147.0",
+        }
+
+    def raw_result(self, rows=None):
+        return {"results": [{
+            "vars": {"arm": row.arm.value, "caseId": row.case_id,
+                     "repetition": row.repetition, "promptDigest": hashlib.sha256(row.case.prompt.encode()).hexdigest(),
+                     "fixtureDigest": skill_eval._fixture_digest(row.baseline_hashes), "sandbox": row.case.sandbox,
+                     "candidate": self.provenance["candidate"], "judge": self.provenance["judge"],
+                     "contractDigest": self.provenance["contract_digest"], "skillRevision": self.provenance["skill_git_revision"],
+                     "skillDigest": self.provenance["skill_digest"], "promptfooVersion": self.provenance["promptfoo_version"],
+                     "codexSdkVersion": self.provenance["codex_sdk_version"]},
+            "success": True, "_containment_safety": True, "trace": [{"event": "complete"}], "assertions": [
+                {"type": "contains", "pass": True}, {"type": "skill-used", "pass": True},
+                {"type": "llm-rubric", "pass": True}, {"type": "safety", "pass": True, "metric": "safety"},
+            ], "latencyMs": 1000, "tokenUsage": {"prompt": 10, "completion": 5}, "cost": 0.01,
+            "output": "must never reach a summary",
+        } for row in (rows or self.rows)]}
+
+    def test_summarizes_complete_release_pairs_without_copying_raw_output(self):
+        summary = skill_eval.summarize_benchmark(self.rows, self.raw_result(), self.provenance)
+
+        self.assertEqual(summary["run"], {"profile": "release", "cases": 9, "arms": 2, "repetitions": 5, "valid_pairs": 45})
+        self.assertEqual(summary["metrics"]["control"]["task_pass_rate"], 1.0)
+        self.assertEqual(summary["metrics"]["treatment"]["input_tokens"], 450)
+        self.assertNotIn("must never reach a summary", json.dumps(summary))
+
+    def test_rejects_a_missing_control_pair(self):
+        rows = [row for row in self.rows if row.arm is skill_eval.BenchmarkArm.TREATMENT]
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "incomplete pair"):
+            skill_eval.summarize_benchmark(rows, self.raw_result(rows), self.provenance)
+
+    def test_rejects_mismatched_prompt_digest_within_a_pair(self):
+        raw = self.raw_result()
+        raw["results"][1]["vars"]["promptDigest"] = "d" * 64
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "prompt digest"):
+            skill_eval.summarize_benchmark(self.rows, raw, self.provenance)
+
+    def test_rejects_mismatched_candidate_provenance(self):
+        raw = self.raw_result()
+        raw["results"][0]["vars"]["candidate"] = "openai:other"
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "candidate provenance"):
+            skill_eval.summarize_benchmark(self.rows, raw, self.provenance)
+
+    def test_bootstrap_interval_is_seed_pinned(self):
+        self.assertEqual(skill_eval.paired_bootstrap([0, 1, 1, -1], samples=100), [-0.63125, 1.0])
+
+    def test_task_score_is_independent_of_activation_and_row_success(self):
+        outcomes = skill_eval._assertion_outcomes([
+            {"type": "contains", "pass": True}, {"type": "skill-used", "pass": False},
+            {"type": "llm-rubric", "pass": True},
+        ], False, True)
+        self.assertEqual(outcomes["task"], 1)
+        self.assertEqual(outcomes["activation"], 0)
+
+    def test_containment_verification_marks_every_row_safe(self):
+        raw = self.raw_result()
+        skill_eval.verify_benchmark_containment(self.rows, raw, self.root / "run")
+        self.assertTrue(all(row["_containment_safety"] for row in raw["results"]))
+        summary = skill_eval.summarize_benchmark(self.rows, raw, self.provenance)
+        self.assertEqual(summary["metrics"]["control"]["safety_passes"], 45)
+        self.assertEqual(summary["metrics"]["treatment"]["safety_total"], 45)
+
+    def test_parses_promptfoo_component_results_and_correlated_traces(self):
+        raw = self.raw_result()
+        traces = {}
+        for index, result in enumerate(raw["results"]):
+            result["testCase"] = {"vars": result.pop("vars")}
+            result["gradingResult"] = {"pass": True, "componentResults": [
+                {"pass": True, "assertion": {"type": "contains"}},
+                {"pass": True, "assertion": {"type": "skill-used"}},
+                {"pass": True, "assertion": {"type": "llm-rubric"}},
+            ]}
+            result.pop("assertions")
+            result["traceId"] = f"trace-{index}"
+            result.pop("trace")
+            traces[result["traceId"]] = {"spans": [{"name": "codex.run", "attributes": {"network": False}}]}
+        raw["traces"] = traces
+        skill_eval.verify_benchmark_containment(self.rows, raw, self.root / "run")
+        self.assertEqual(skill_eval.summarize_benchmark(self.rows, raw, self.provenance)["run"]["valid_pairs"], 45)
+
+    def test_containment_rejects_missing_verifier(self):
+        (self.root / "run" / "verifiers" / "direct-token-1-control.json").unlink()
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "missing trace/verifier"):
+            skill_eval.verify_benchmark_containment(self.rows, self.raw_result(), self.root / "run")
+
+    def test_containment_rejects_missing_trace(self):
+        raw = self.raw_result()
+        raw["results"][0].pop("trace")
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "missing trace/verifier"):
+            skill_eval.verify_benchmark_containment(self.rows, raw, self.root / "run")
+
+    def test_containment_rejects_baseline_mutation(self):
+        (self.rows[0].workspace_dir / "README.md").write_text("changed\n", encoding="utf-8")
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "post-staging workspace mutation"):
+            skill_eval.verify_benchmark_containment(self.rows, self.raw_result(), self.root / "run")
+
+    def test_containment_rejects_added_workspace_file(self):
+        (self.rows[0].workspace_dir / "unexpected.txt").write_text("added\n", encoding="utf-8")
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "post-staging workspace mutation"):
+            skill_eval.verify_benchmark_containment(self.rows, self.raw_result(), self.root / "run")
+
+    def test_containment_rejects_post_staging_git_change(self):
+        (self.rows[0].workspace_dir / ".git" / "unexpected").write_text("changed\n", encoding="utf-8")
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "post-staging workspace mutation"):
+            skill_eval.verify_benchmark_containment(self.rows, self.raw_result(), self.root / "run")
+
+    def test_containment_rejects_empty_directory_and_mode_change(self):
+        (self.rows[0].workspace_dir / "empty").mkdir()
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "post-staging workspace mutation"):
+            skill_eval.verify_benchmark_containment(self.rows, self.raw_result(), self.root / "run")
+        (self.rows[0].workspace_dir / "empty").rmdir()
+        target = self.rows[0].workspace_dir / "README.md"
+        target.chmod(0o600)
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "post-staging workspace mutation"):
+            skill_eval.verify_benchmark_containment(self.rows, self.raw_result(), self.root / "run")
+
+    def test_containment_rejects_symlink_without_following_it(self):
+        (self.rows[0].workspace_dir / "link").symlink_to("README.md")
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "non-regular entry"):
+            skill_eval.verify_benchmark_containment(self.rows, self.raw_result(), self.root / "run")
+
+    def test_containment_rejects_structured_search_and_forbidden_command(self):
+        for attrs in ({"codex.search.query": "private"}, {"name": 'search "private"'}, {"codex.command": "curl blocked"}):
+            with self.subTest(attrs=attrs):
+                raw = self.raw_result()
+                raw["results"][0]["trace"] = [{"attributes": attrs}]
+                with self.assertRaisesRegex(skill_eval.SkillEvalError, "forbidden command/network"):
+                    skill_eval.verify_benchmark_containment(self.rows, raw, self.root / "run")
+
+    def test_named_release_rejects_alternate_case_set_and_privileged_sandbox(self):
+        named = [replace(row, skill_name="github-public-readiness") for row in self.rows]
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "preregistered IDs"):
+            skill_eval._validate_preregistered_release_rows(named)
+        actual_ids = list(skill_eval.PUBLIC_CASE_IDS)
+        rows = [replace(row, case=replace(row.case, case_id=actual_ids[index % 9], sandbox="workspace-write"), case_id=actual_ids[index % 9], skill_name="github-public-readiness") for index, row in enumerate(self.rows)]
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "read-only"):
+            skill_eval._validate_preregistered_release_rows(rows)
+
+    def test_containment_rejects_every_canary_leak(self):
+        verifier = json.loads((self.root / "run" / "verifiers" / "direct-token-1-control.json").read_text())
+        for canary in verifier["canaries"].values():
+            with self.subTest(canary=canary):
+                raw = self.raw_result()
+                raw["results"][0]["trace"] = [{"leak": canary}]
+                with self.assertRaisesRegex(skill_eval.SkillEvalError, "canary leakage"):
+                    skill_eval.verify_benchmark_containment(self.rows, raw, self.root / "run")
+
+    def test_containment_rejects_forbidden_network_and_command_markers(self):
+        for marker in ("network", "forbidden_command"):
+            with self.subTest(marker=marker):
+                raw = self.raw_result()
+                raw["results"][0]["trace"] = [{marker: True}]
+                with self.assertRaisesRegex(skill_eval.SkillEvalError, "forbidden command/network"):
+                    skill_eval.verify_benchmark_containment(self.rows, raw, self.root / "run")
+
+    def test_containment_correlates_evaluation_trace_and_rejects_codex_command(self):
+        raw = self.raw_result()
+        raw["results"][0]["evaluationId"] = "eval-1"
+        raw["results"][0].pop("trace")
+        raw["traces"] = {"eval-1": {"spans": [{"attributes": {"codex.item.type": "command_execution", "codex.command": "curl example.invalid"}}]}}
+        with self.assertRaisesRegex(skill_eval.SkillEvalError, "forbidden command/network"):
+            skill_eval.verify_benchmark_containment(self.rows, raw, self.root / "run")
+
+    def test_public_result_rejects_raw_answer_and_unknown_fields(self):
+        for key, value in {
+            "raw_prompt": "secret request", "raw_answer": "not publishable", "trace": "private trace",
+            "path": "/Users/example/private", "authorization": "Bearer secret", "email": "person@example.com",
+            "hostname": "runner.internal", "canary": "canary-token", "unexpected": "value",
+        }.items():
+            with self.subTest(key=key), self.assertRaises(skill_eval.SkillEvalError):
+                skill_eval.validate_benchmark_public_result({key: value})
+
+    def test_public_result_rejects_sensitive_values_in_allowed_fields(self):
+        summary = skill_eval.summarize_benchmark(self.rows, self.raw_result(), self.provenance)
+        for value in ("/Users/example/private", "Authorization: Bearer secret", "person@example.com", "runner.internal", "canary-token", "raw answer", "trace transcript"):
+            with self.subTest(value=value):
+                payload = dict(summary)
+                payload["limitations"] = [value]
+                with self.assertRaises(skill_eval.SkillEvalError):
+                    skill_eval.validate_benchmark_public_result(payload)
+
+    def test_public_result_rejects_env_tokens_private_hosts_and_freeform_case_data(self):
+        summary = skill_eval.summarize_benchmark(self.rows, self.raw_result(), self.provenance)
+        for value in ("TOKEN=secret", "${HOME}", "ghp_abcdefghijklmnop", "http://127.0.0.1", "confidential notes"):
+            with self.subTest(value=value):
+                payload = dict(summary)
+                payload["limitations"] = [value]
+                with self.assertRaises(skill_eval.SkillEvalError):
+                    skill_eval.validate_benchmark_public_result(payload)
 
 
 if __name__ == "__main__":

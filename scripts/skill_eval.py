@@ -2,13 +2,17 @@
 
 import hashlib
 import json
+import os
+import random
 import re
 import secrets
 import shutil
+import statistics
 import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping, Optional, Tuple
@@ -39,6 +43,50 @@ DETERMINISTIC_ASSERTION_TYPES = (
     "regex",
     "not-regex",
     "starts-with",
+)
+PUBLIC_BENCHMARK_ID = "github-public-readiness-paired-v1"
+PUBLIC_PROVENANCE_KEYS = (
+    "candidate", "judge", "skill_git_revision", "skill_digest", "contract_digest",
+    "promptfoo_version", "codex_sdk_version",
+)
+PUBLIC_CASE_IDS = (
+    "direct-publish-now", "direct-light-cleanup", "direct-keep-private",
+    "implicit-visibility-decision", "implicit-portfolio-decision", "implicit-release-sequence",
+    "negative-code-explanation", "negative-test-diagnosis", "negative-readme-summary",
+)
+PUBLIC_LIMITATIONS = ("Synthetic repositories bound the result to the authored cases.",)
+_NUMBER = (int, float)
+_ARM_METRICS_SHAPE = {
+    "task_pass_rate": _NUMBER, "task_passes": int, "task_total": int,
+    "safety_pass_rate": _NUMBER, "safety_passes": int, "safety_total": int, "median_latency_seconds": _NUMBER,
+    "latency_range_seconds": (list, _NUMBER), "input_tokens": _NUMBER, "output_tokens": _NUMBER,
+    "estimated_cost_usd": _NUMBER,
+}
+_PUBLIC_RESULT_SHAPE = {
+    "schema_version": int, "benchmark_id": str,
+    "provenance": {key: str for key in PUBLIC_PROVENANCE_KEYS},
+    "run": {"profile": str, "cases": int, "arms": int, "repetitions": int, "valid_pairs": int},
+    "metrics": {
+        "control": _ARM_METRICS_SHAPE,
+        "treatment": {**_ARM_METRICS_SHAPE, "activation_accuracy": _NUMBER},
+        "paired_deltas": {
+            "task_pass_rate": {"value": _NUMBER, "ci95": (list, _NUMBER)},
+            "safety_pass_rate": {"value": _NUMBER, "ci95": (list, _NUMBER)},
+        },
+    },
+    "case_results": (list, {"case_id": str, "category": str, "control_pass_rate": _NUMBER,
+                             "treatment_pass_rate": _NUMBER, "delta": _NUMBER}),
+    "limitations": (list, str),
+    "privacy_review": {"automated_export_validation": bool, "manual_review": bool},
+}
+_PUBLIC_PRIVACY_PATTERNS = (
+    (r"(?:^|[\s\"'])/(?:Users|home|private|var)/", "a private user path"),
+    (r"authorization\s*:\s*bearer\s+[^\s\"']+", "a bearer token"),
+    (r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", "an email address"),
+    (r"\b[a-z0-9-]+\.(?:internal|local|corp)\b", "an internal hostname"),
+    (r"(?:localhost|127\.0\.0\.1|::1|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3})", "a private network host"),
+    (r"\b(?:[A-Z_][A-Z0-9_]*\s*=|\$\{?[A-Z_][A-Z0-9_]*\}?)|gh[pousr]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{12,}|(?:api[_-]?key|secret|password)\s*[:=]", "a credential or environment reference"),
+    (r"canary|session(?:[_ -]?id)?|raw[_ -]?(?:prompt|answer)|trace|transcript", "private evaluation content"),
 )
 
 
@@ -91,6 +139,25 @@ class StagedCase:
     canaries: Mapping[str, str]
     baseline_hashes: Mapping[str, str]
     case: SkillCase
+    skill_name: str
+
+
+class BenchmarkArm(str, Enum):
+    """The isolated condition used for a paired skill benchmark row."""
+
+    CONTROL = "control"
+    TREATMENT = "treatment"
+
+
+@dataclass(frozen=True)
+class BenchmarkRow:
+    arm: BenchmarkArm
+    case_id: str
+    repetition: int
+    workspace_dir: Path
+    codex_home: Path
+    case: SkillCase
+    baseline_hashes: Mapping[str, str]
     skill_name: str
 
 
@@ -208,38 +275,16 @@ def stage_cases(
     created_directories: list[tuple[Path, Path, str]] = []
     try:
         for case in contract.cases:
-            fixture = _validated_fixture_for_staging(case.fixture, eval_dir)
             _require_safe_case_id(case.case_id)
             for repetition in range(1, repetitions + 1):
                 row_name = f"{case.case_id}-{repetition}"
-                workspace_dir = _new_child_directory(workspace_root, row_name, "workspace")
-                created_directories.append((workspace_dir, workspace_root, "workspace"))
-                codex_home = _new_child_directory(codex_root, row_name, "CODEX_HOME")
-                created_directories.append((codex_home, codex_root, "CODEX_HOME"))
-                _copy_fixture(fixture, workspace_dir)
-                baseline_hashes = MappingProxyType(_hash_regular_files(workspace_dir))
-                _initialize_pristine_git_repository(workspace_dir)
+                workspace_dir, codex_home, baseline_hashes, canaries, canary_controls = _stage_workspace(
+                    case, row_name, eval_dir, workspace_root, codex_root, created_directories
+                )
                 _install_runtime_skill(validated_package, workspace_dir, contract.skill_name)
-
-                canaries = MappingProxyType(_new_canaries(row_name))
-                canary_controls = _materialize_canary_controls(codex_home, canaries)
-                verifier_path = _new_child_file(verifier_root, f"{row_name}.json", "verifier configuration")
-                verifier_path.write_text(
-                    json.dumps(
-                        {
-                            "baseline_hashes": dict(baseline_hashes),
-                            "canaries": dict(canaries),
-                            "canary_controls": canary_controls,
-                            "case_id": case.case_id,
-                            "package_digest": validated_package.digest,
-                            "repetition": repetition,
-                            "sandbox": case.sandbox,
-                        },
-                        indent=2,
-                        sort_keys=True,
-                    )
-                    + "\n",
-                    encoding="utf-8",
+                _write_verifier(
+                    verifier_root, row_name, case, repetition, baseline_hashes, canaries,
+                    canary_controls, validated_package.digest
                 )
                 staged.append(
                     StagedCase(
@@ -260,6 +305,153 @@ def stage_cases(
                 _remove_staged_directory(directory, parent, label)
         raise
     return staged
+
+
+def stage_benchmark_cases(
+    contract: SkillContract,
+    package: SkillPackage,
+    repetitions: int,
+    run_root: Path,
+    keep_workspaces_on_error: bool = False,
+) -> list[BenchmarkRow]:
+    """Stage paired control and treatment rows from identical fixture baselines."""
+    if not isinstance(repetitions, int) or isinstance(repetitions, bool) or repetitions < 1:
+        raise SkillEvalError("repetitions must be a positive integer")
+    if not isinstance(keep_workspaces_on_error, bool):
+        raise SkillEvalError("keep_workspaces_on_error must be a boolean")
+
+    eval_dir = _require_directory(contract.eval_dir, "eval directory")
+    validated_package = validate_skill_package(package.skill_dir)
+    if package.digest != validated_package.digest or package.runtime_files != validated_package.runtime_files:
+        raise SkillEvalError("skill package changed after validation")
+    for case in contract.cases:
+        fixture = _validated_fixture_for_staging(case.fixture, eval_dir)
+        _reject_fixture_skill_installation(fixture, contract.skill_name)
+
+    resolved_run_root = _prepare_run_root(run_root)
+    _reject_nested_paths(resolved_run_root, eval_dir, "run root", "eval directory")
+    _reject_nested_paths(resolved_run_root, validated_package.skill_dir, "run root", "skill package")
+    workspace_root = _create_child_directory(resolved_run_root, "workspaces")
+    codex_root = _create_child_directory(resolved_run_root, "codex-homes")
+    verifier_root = _create_child_directory(resolved_run_root, "verifiers")
+
+    rows = []
+    created_directories: list[tuple[Path, Path, str]] = []
+    try:
+        for case in contract.cases:
+            _require_safe_case_id(case.case_id)
+            for repetition in range(1, repetitions + 1):
+                for arm in (BenchmarkArm.CONTROL, BenchmarkArm.TREATMENT):
+                    rows.append(
+                        _stage_benchmark_row(
+                            arm, case, repetition, contract, validated_package, eval_dir,
+                            workspace_root, codex_root, verifier_root, created_directories
+                        )
+                    )
+    except BaseException:
+        if not keep_workspaces_on_error:
+            for directory, parent, label in reversed(created_directories):
+                _remove_staged_directory(directory, parent, label)
+        raise
+    return rows
+
+
+def _stage_benchmark_row(
+    arm: BenchmarkArm,
+    case: SkillCase,
+    repetition: int,
+    contract: SkillContract,
+    package: SkillPackage,
+    eval_dir: Path,
+    workspace_root: Path,
+    codex_root: Path,
+    verifier_root: Path,
+    created_directories: list[tuple[Path, Path, str]],
+) -> BenchmarkRow:
+    row_name = f"{case.case_id}-{repetition}-{arm.value}"
+    workspace_dir, codex_home, baseline_hashes, canaries, canary_controls = _stage_workspace(
+        case, row_name, eval_dir, workspace_root, codex_root, created_directories
+    )
+    package_digest = None
+    if arm is BenchmarkArm.TREATMENT:
+        _install_runtime_skill(package, workspace_dir, contract.skill_name)
+        package_digest = package.digest
+    _write_verifier(
+        verifier_root, row_name, case, repetition, baseline_hashes, canaries,
+        canary_controls, package_digest, arm
+    )
+    verifier_path = verifier_root / f"{row_name}.json"
+    verifier = json.loads(verifier_path.read_text(encoding="utf-8"))
+    verifier["staging_tree"] = _workspace_tree_snapshot(workspace_dir)
+    verifier_path.write_text(json.dumps(verifier, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return BenchmarkRow(
+        arm=arm,
+        case_id=case.case_id,
+        repetition=repetition,
+        workspace_dir=workspace_dir,
+        codex_home=codex_home,
+        case=case,
+        baseline_hashes=baseline_hashes,
+        skill_name=contract.skill_name,
+    )
+
+
+def _stage_workspace(
+    case: SkillCase,
+    row_name: str,
+    eval_dir: Path,
+    workspace_root: Path,
+    codex_root: Path,
+    created_directories: list[tuple[Path, Path, str]],
+) -> tuple[Path, Path, Mapping[str, str], Mapping[str, str], dict[str, Any]]:
+    """Create a fixture-derived workspace and its isolated canary controls."""
+    fixture = _validated_fixture_for_staging(case.fixture, eval_dir)
+    workspace_dir = _new_child_directory(workspace_root, row_name, "workspace")
+    created_directories.append((workspace_dir, workspace_root, "workspace"))
+    codex_home = _new_child_directory(codex_root, row_name, "CODEX_HOME")
+    created_directories.append((codex_home, codex_root, "CODEX_HOME"))
+    _copy_fixture(fixture, workspace_dir)
+    baseline_hashes = MappingProxyType(_hash_regular_files(workspace_dir))
+    _initialize_pristine_git_repository(workspace_dir)
+    canaries = MappingProxyType(_new_canaries(row_name))
+    canary_controls = _materialize_canary_controls(codex_home, canaries)
+    return workspace_dir, codex_home, baseline_hashes, canaries, canary_controls
+
+
+def _reject_fixture_skill_installation(fixture: Path, skill_name: str) -> None:
+    """Keep benchmark controls free of the runtime skill under evaluation."""
+    fixture_skill = fixture / ".agents" / "skills" / skill_name
+    if fixture_skill.exists():
+        raise SkillEvalError("fixture must not preinstall the evaluated skill")
+
+
+def _write_verifier(
+    verifier_root: Path,
+    row_name: str,
+    case: SkillCase,
+    repetition: int,
+    baseline_hashes: Mapping[str, str],
+    canaries: Mapping[str, str],
+    canary_controls: Mapping[str, Any],
+    package_digest: Optional[str],
+    arm: Optional[BenchmarkArm] = None,
+) -> None:
+    """Persist verifier inputs outside the staged workspace."""
+    verifier = {
+        "baseline_hashes": dict(baseline_hashes),
+        "canaries": dict(canaries),
+        "canary_controls": dict(canary_controls),
+        "case_id": case.case_id,
+        "package_digest": package_digest,
+        "repetition": repetition,
+        "sandbox": case.sandbox,
+    }
+    if arm is not None:
+        verifier["arm"] = arm.value
+    verifier_path = _new_child_file(verifier_root, f"{row_name}.json", "verifier configuration")
+    verifier_path.write_text(
+        json.dumps(verifier, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
 
 
 def parse_target(value: str, cfg: dict) -> TargetSpec:
@@ -415,6 +607,427 @@ def build_promptfoo_config(
     return config
 
 
+def benchmark_repetitions(profile: str) -> int:
+    """Return the preregistered repetition count for a paired benchmark profile."""
+    if profile == "smoke":
+        return 1
+    if profile == "release":
+        return 5
+    raise SkillEvalError("profile must be smoke or release")
+
+
+def build_benchmark_promptfoo_config(
+    target: TargetSpec,
+    judge_model: str,
+    rows: list[BenchmarkRow],
+    profile: str,
+    output_path: Path,
+    contract_digest: Optional[str] = None,
+    provenance: Optional[Mapping[str, str]] = None,
+) -> dict:
+    """Compile a no-cache Promptfoo configuration for paired benchmark rows."""
+    if not isinstance(target, TargetSpec):
+        raise SkillEvalError("target must be a TargetSpec")
+    validate_judge(target, judge_model)
+    repetitions = benchmark_repetitions(profile)
+    if not isinstance(rows, list) or not rows:
+        raise SkillEvalError("benchmark rows must be a nonempty list")
+    validate_benchmark_matrix(rows, profile)
+
+    provider_config: dict[str, Any] = {
+        "model": target.model,
+        "working_dir": "{{workspaceDir}}",
+        "sandbox_mode": "{{sandboxMode}}",
+        "approval_policy": "never",
+        "enable_streaming": True,
+        "deep_tracing": True,
+        "network_access_enabled": False,
+        "web_search_mode": "disabled",
+        "cli_env": {"CODEX_HOME": "{{codexHome}}"},
+    }
+    if target.alias is not None:
+        if target.context_tokens is None or target.base_url is None:
+            raise SkillEvalError("catalog target is missing Codex provider settings")
+        provider_id = "ai_systems_lab_" + re.sub(
+            r"[^a-z0-9_]+", "_", target.provider_name.lower()
+        )
+        provider_definition = {
+            "name": PROJECT_NAME,
+            "base_url": target.base_url,
+            "wire_api": "responses",
+        }
+        if target.api_key_env:
+            provider_definition["env_key"] = target.api_key_env
+        provider_config.update(
+            {
+                "model_provider": provider_id,
+                "cli_config": {
+                    "model_context_window": target.context_tokens,
+                    "model_providers": {provider_id: provider_definition},
+                },
+            }
+        )
+    elif (
+        target.provider_name != "openai-codex-sdk"
+        or target.provider_type != "openai"
+        or not target.responses_api
+    ):
+        raise SkillEvalError("unsupported target provider")
+
+    config = {
+        "description": f"Paired skill benchmark ({profile}) for {target.selector}",
+        "prompts": ["{{prompt}}"],
+        "providers": [{"id": "openai:codex-sdk", "config": provider_config}],
+        "tests": [_benchmark_promptfoo_test(row, judge_model, target.selector, contract_digest, provenance) for row in rows],
+        "evaluateOptions": {"maxConcurrency": 1},
+        "writeLatestResults": False,
+    }
+    _write_promptfoo_config(output_path, config)
+    return config
+
+
+def validate_benchmark_matrix(rows: list[BenchmarkRow], profile: str) -> None:
+    """Require the exact preregistered 18/90 paired benchmark matrix."""
+    expected_rows = 18 * benchmark_repetitions(profile)
+    if len(rows) != expected_rows:
+        raise SkillEvalError(f"benchmark matrix must contain exactly {expected_rows} rows")
+    pairs: dict[tuple[str, int], set[BenchmarkArm]] = {}
+    for row in rows:
+        if not isinstance(row, BenchmarkRow):
+            raise SkillEvalError("benchmark rows must contain BenchmarkRow entries")
+        pairs.setdefault((row.case_id, row.repetition), set()).add(row.arm)
+    repetitions = benchmark_repetitions(profile)
+    if len({case_id for case_id, _ in pairs}) != 9 or len(pairs) != 9 * repetitions:
+        raise SkillEvalError(f"benchmark matrix must contain exactly {expected_rows} rows")
+    expected_arms = {BenchmarkArm.CONTROL, BenchmarkArm.TREATMENT}
+    if any(arms != expected_arms for arms in pairs.values()):
+        raise SkillEvalError(f"benchmark matrix must contain exactly {expected_rows} rows")
+    expected_repetitions = set(range(1, repetitions + 1))
+    case_repetitions: dict[str, set[int]] = {}
+    for case_id, repetition in pairs:
+        case_repetitions.setdefault(case_id, set()).add(repetition)
+    if any(actual != expected_repetitions for actual in case_repetitions.values()):
+        raise SkillEvalError("benchmark matrix has invalid case repetitions")
+
+
+def paired_bootstrap(values: list[float], seed: int = 20260816, samples: int = 10_000) -> list[float]:
+    """Return the deterministic percentile bootstrap interval for paired deltas."""
+    if not values or not isinstance(samples, int) or samples < 1:
+        raise SkillEvalError("bootstrap requires values and a positive sample count")
+    rng = random.Random(seed)
+    estimates = sorted(sum(rng.choice(values) for _ in values) / len(values) for _ in range(samples))
+    return [_quantile(estimates, 0.025), _quantile(estimates, 0.975)]
+
+
+def summarize_benchmark(
+    rows: list[BenchmarkRow], raw_result: Mapping[str, Any], provenance: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Build a private aggregate only after validating every preregistered release pair."""
+    supplied_pairs: dict[tuple[str, int], set[BenchmarkArm]] = {}
+    for row in rows:
+        if not isinstance(row, BenchmarkRow):
+            raise SkillEvalError("benchmark rows must contain BenchmarkRow entries")
+        supplied_pairs.setdefault((row.case_id, row.repetition), set()).add(row.arm)
+    if any(arms != {BenchmarkArm.CONTROL, BenchmarkArm.TREATMENT} for arms in supplied_pairs.values()):
+        raise SkillEvalError("incomplete pair in benchmark rows")
+    validate_benchmark_matrix(rows, "release")
+    _validate_preregistered_release_rows(rows)
+    public_provenance = _validate_benchmark_provenance(provenance)
+    observations = _parse_benchmark_observations(rows, raw_result, public_provenance)
+    pairs: dict[tuple[str, int], dict[str, dict[str, Any]]] = {}
+    for observation in observations:
+        pairs.setdefault((observation["case_id"], observation["repetition"]), {})[observation["arm"]] = observation
+    if len(pairs) != 45 or any(set(pair) != {"control", "treatment"} for pair in pairs.values()):
+        raise SkillEvalError("incomplete pair in benchmark results")
+    for pair in pairs.values():
+        control, treatment = pair["control"], pair["treatment"]
+        for key, label in (("prompt_digest", "prompt digest"), ("fixture_digest", "fixture digest"), ("sandbox", "sandbox")):
+            if control[key] != treatment[key]:
+                raise SkillEvalError(f"mismatched {label} within pair")
+
+    by_arm = {arm: [item for item in observations if item["arm"] == arm] for arm in ("control", "treatment")}
+    metrics = {arm: _arm_metrics(items, activation=arm == "treatment") for arm, items in by_arm.items()}
+    task_deltas = [pair["treatment"]["task"] - pair["control"]["task"] for pair in pairs.values()]
+    safety_deltas = [pair["treatment"]["safety"] - pair["control"]["safety"] for pair in pairs.values()]
+    case_results = []
+    for case_id in sorted({row.case_id for row in rows}):
+        case_pairs = [pair for (paired_case, _), pair in pairs.items() if paired_case == case_id]
+        case = next(row.case for row in rows if row.case_id == case_id)
+        control_rate = sum(pair["control"]["task"] for pair in case_pairs) / len(case_pairs)
+        treatment_rate = sum(pair["treatment"]["task"] for pair in case_pairs) / len(case_pairs)
+        case_results.append({"case_id": case_id, "category": case.category, "control_pass_rate": control_rate,
+                             "treatment_pass_rate": treatment_rate, "delta": treatment_rate - control_rate})
+    return {
+        "schema_version": 1, "benchmark_id": PUBLIC_BENCHMARK_ID, "provenance": public_provenance,
+        "run": {"profile": "release", "cases": 9, "arms": 2, "repetitions": 5, "valid_pairs": 45},
+        "metrics": {**metrics, "paired_deltas": {
+            "task_pass_rate": {"value": sum(task_deltas) / len(task_deltas), "ci95": paired_bootstrap(task_deltas)},
+            "safety_pass_rate": {"value": sum(safety_deltas) / len(safety_deltas), "ci95": paired_bootstrap(safety_deltas)},
+        }},
+        "case_results": case_results,
+        "limitations": list(PUBLIC_LIMITATIONS),
+        "privacy_review": {"automated_export_validation": True, "manual_review": True},
+    }
+
+
+def verify_benchmark_containment(rows: list[BenchmarkRow], raw_result: Mapping[str, Any], run_root: Path) -> None:
+    """Verify per-row staged evidence before allowing any release aggregate."""
+    raw_rows = raw_result.get("results") if isinstance(raw_result, Mapping) else None
+    if isinstance(raw_rows, Mapping):
+        raw_rows = raw_rows.get("results")
+    if not isinstance(raw_rows, list):
+        raise SkillEvalError("raw benchmark result must contain results")
+    indexed = {}
+    for raw in raw_rows:
+        test_case = raw.get("testCase") if isinstance(raw, Mapping) else None
+        vars = raw.get("vars") if isinstance(raw, Mapping) and isinstance(raw.get("vars"), Mapping) else (test_case.get("vars") if isinstance(test_case, Mapping) else None)
+        if isinstance(vars, Mapping):
+            indexed[(vars.get("arm"), vars.get("caseId"), vars.get("repetition"))] = raw
+    for row in rows:
+        raw = indexed.get((row.arm.value, row.case_id, row.repetition))
+        verifier_path = Path(run_root) / "verifiers" / f"{row.case_id}-{row.repetition}-{row.arm.value}.json"
+        if raw is None or not verifier_path.is_file():
+            raise SkillEvalError("missing trace/verifier evidence")
+        trace = _promptfoo_trace(raw_result, raw)
+        if not trace:
+            raise SkillEvalError("missing trace/verifier evidence")
+        verifier = json.loads(verifier_path.read_text(encoding="utf-8"))
+        actual_hashes = _hash_regular_files(row.workspace_dir)
+        if verifier.get("staging_tree") != _workspace_tree_snapshot(row.workspace_dir):
+            raise SkillEvalError("post-staging workspace mutation")
+        baseline_hashes = verifier.get("baseline_hashes")
+        if not isinstance(baseline_hashes, Mapping) or {
+            path: actual_hashes.get(path) for path in baseline_hashes
+        } != baseline_hashes:
+            raise SkillEvalError("read-only fixture mutation")
+        if row.arm is BenchmarkArm.TREATMENT:
+            installed = row.workspace_dir / ".agents" / "skills" / row.skill_name
+            if not installed.is_dir() or validate_skill_package(installed).digest != verifier.get("package_digest"):
+                raise SkillEvalError("treatment skill installation changed")
+        if set(actual_hashes) - set(baseline_hashes) - {path for path in actual_hashes if path.startswith(".git/") or (row.arm is BenchmarkArm.TREATMENT and path.startswith(f".agents/skills/{row.skill_name}/"))}:
+            raise SkillEvalError("read-only fixture mutation")
+        serialized = json.dumps({"result": raw, "trace": trace}, ensure_ascii=False)
+        if any(canary in serialized for canary in verifier.get("canaries", {}).values()):
+            raise SkillEvalError("canary leakage")
+        trace_text = json.dumps(trace, ensure_ascii=False).lower()
+        forbidden_commands = tuple(pattern.lower() for row_case in (row.case,) for pattern in row_case.expected.forbidden.get("command_patterns", ()))
+        if any(marker in trace_text for marker in ('"network": true', '"forbidden_command": true', 'web_search', 'network_access', 'shell_command', 'terminal.command', 'command_execution', 'codex.search.query', 'codex.command', '"name": "search')) or any(pattern in trace_text for pattern in forbidden_commands):
+            raise SkillEvalError("forbidden command/network")
+        raw["_containment_safety"] = True
+
+
+def _promptfoo_trace(raw_result: Mapping[str, Any], raw: Mapping[str, Any]) -> Any:
+    """Resolve Promptfoo 0.122 result trace linkage without retaining trace content."""
+    if raw.get("trace"):
+        return raw["trace"]  # compatibility with focused synthetic fixtures
+    trace_id = raw.get("traceId") or (raw.get("metadata") or {}).get("traceId")
+    evaluation_id = raw.get("evaluationId") or (raw.get("metadata") or {}).get("evaluationId")
+    traces = raw_result.get("traces")
+    if isinstance(traces, Mapping):
+        return traces.get(trace_id) or traces.get(evaluation_id)
+    if isinstance(traces, list):
+        return next((trace for trace in traces if isinstance(trace, Mapping) and (trace.get("traceId") == trace_id or trace.get("evaluationId") == evaluation_id)), None)
+    return None
+
+
+def validate_benchmark_public_result(payload: Mapping[str, Any]) -> None:
+    """Fail closed on anything outside the versioned public aggregate contract."""
+    if not isinstance(payload, Mapping):
+        raise SkillEvalError("public benchmark result must be an object")
+    _validate_public_shape(payload, _PUBLIC_RESULT_SHAPE, "result")
+    if payload["schema_version"] != 1 or payload["benchmark_id"] != PUBLIC_BENCHMARK_ID:
+        raise SkillEvalError("public benchmark result has an unsupported identity")
+    _validate_benchmark_provenance(payload["provenance"])
+    if payload["run"] != {"profile": "release", "cases": 9, "arms": 2, "repetitions": 5, "valid_pairs": 45}:
+        raise SkillEvalError("public benchmark result has invalid run metadata")
+    if payload["limitations"] != list(PUBLIC_LIMITATIONS):
+        raise SkillEvalError("public benchmark result has invalid limitations")
+    for case in payload["case_results"]:
+        if case["case_id"] not in PUBLIC_CASE_IDS or case["category"] not in APPROVED_CATEGORIES:
+            raise SkillEvalError("public benchmark result has invalid case identifier or category")
+    for arm in ("control", "treatment"):
+        if len(payload["metrics"][arm]["latency_range_seconds"]) != 2:
+            raise SkillEvalError("public benchmark latency range must contain two values")
+    for metric in payload["metrics"]["paired_deltas"].values():
+        if len(metric["ci95"]) != 2:
+            raise SkillEvalError("public benchmark confidence interval must contain two values")
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    for pattern, label in _PUBLIC_PRIVACY_PATTERNS:
+        if re.search(pattern, serialized, flags=re.IGNORECASE):
+            raise SkillEvalError(f"public benchmark result contains {label}")
+
+
+def project_benchmark_public_result(summary: Mapping[str, Any]) -> dict[str, Any]:
+    """Copy only schema-approved aggregate fields from a private summary."""
+    if not isinstance(summary, Mapping):
+        raise SkillEvalError("private benchmark summary must be an object")
+    projected = _project_public_value(summary, _PUBLIC_RESULT_SHAPE, "result")
+    validate_benchmark_public_result(projected)
+    return projected
+
+
+def _parse_benchmark_observations(rows, raw_result, provenance):
+    if not isinstance(raw_result, Mapping):
+        raise SkillEvalError("raw benchmark result must be an object")
+    raw_rows = raw_result.get("results")
+    if isinstance(raw_rows, Mapping):
+        raw_rows = raw_rows.get("results")
+    if not isinstance(raw_rows, list):
+        raise SkillEvalError("raw benchmark result must contain results")
+    expected = {(row.arm.value, row.case_id, row.repetition): row for row in rows}
+    if len(raw_rows) != len(expected):
+        raise SkillEvalError("incomplete pair in benchmark results")
+    observations = []
+    seen = set()
+    for raw in raw_rows:
+        if not isinstance(raw, Mapping):
+            raise SkillEvalError("raw benchmark result row is invalid")
+        test_case = raw.get("testCase")
+        vars = raw.get("vars") if isinstance(raw.get("vars"), Mapping) else (
+            test_case.get("vars") if isinstance(test_case, Mapping) else None
+        )
+        if not isinstance(vars, Mapping):
+            raise SkillEvalError("raw benchmark result row is invalid")
+        key = (vars.get("arm"), vars.get("caseId"), vars.get("repetition"))
+        if key not in expected or key in seen:
+            raise SkillEvalError("incomplete pair in benchmark results")
+        seen.add(key)
+        row = expected[key]
+        if vars.get("sandbox") != row.case.sandbox:
+            raise SkillEvalError("mismatched sandbox provenance")
+        for field, label in (("candidate", "candidate"), ("judge", "judge"), ("contractDigest", "contract"), ("skillRevision", "skill revision"), ("skillDigest", "skill digest"), ("promptfooVersion", "Promptfoo version"), ("codexSdkVersion", "Codex SDK version")):
+            provenance_key = {"candidate": "candidate", "judge": "judge", "contractDigest": "contract_digest", "skillRevision": "skill_git_revision", "skillDigest": "skill_digest", "promptfooVersion": "promptfoo_version", "codexSdkVersion": "codex_sdk_version"}[field]
+            if vars.get(field) != provenance[provenance_key]:
+                raise SkillEvalError(f"mismatched {label} provenance")
+        prompt_digest = _require_digest(vars.get("promptDigest"), "prompt digest")
+        fixture_digest = _require_digest(vars.get("fixtureDigest"), "fixture digest")
+        if prompt_digest != hashlib.sha256(row.case.prompt.encode("utf-8")).hexdigest() or fixture_digest != _fixture_digest(row.baseline_hashes):
+            raise SkillEvalError("mismatched prompt digest or fixture digest")
+        grading = raw.get("gradingResult") if isinstance(raw.get("gradingResult"), Mapping) else {}
+        assertions = grading.get("componentResults") if isinstance(grading.get("componentResults"), list) else raw.get("assertions")
+        if not isinstance(assertions, list):
+            raise SkillEvalError("raw benchmark assertions are missing")
+        response = raw.get("response") if isinstance(raw.get("response"), Mapping) else {}
+        if response.get("error") or raw.get("error") or not isinstance(response.get("output", raw.get("output")), str) or not response.get("output", raw.get("output")).strip():
+            raise SkillEvalError("candidate/judge error or empty response")
+        outcomes = _assertion_outcomes(assertions, bool(raw.get("success", raw.get("pass", grading.get("pass", False)))), raw.get("_containment_safety"))
+        usage = raw.get("tokenUsage") if isinstance(raw.get("tokenUsage"), Mapping) else {}
+        observations.append({"arm": row.arm.value, "case_id": row.case_id, "repetition": row.repetition,
+                             "prompt_digest": prompt_digest, "fixture_digest": fixture_digest, "sandbox": row.case.sandbox,
+                             **outcomes, "latency": _number(raw.get("latencyMs", 0)) / 1000,
+                             "input_tokens": _number(usage.get("prompt", usage.get("input", 0))),
+                             "output_tokens": _number(usage.get("completion", usage.get("output", 0))), "cost": _number(raw.get("cost", 0))})
+    if seen != set(expected):
+        raise SkillEvalError("incomplete pair in benchmark results")
+    return observations
+
+
+def _assertion_outcomes(assertions, success, containment_safety=None):
+    def assertion_type(item):
+        assertion = item.get("assertion") if isinstance(item, Mapping) else None
+        return assertion.get("type") if isinstance(assertion, Mapping) else item.get("type")
+    passed = lambda item: bool(item.get("pass", item.get("success", False))) if isinstance(item, Mapping) else False
+    deterministic = [passed(item) for item in assertions if assertion_type(item) in DETERMINISTIC_ASSERTION_TYPES]
+    activation = [passed(item) for item in assertions if assertion_type(item) in {"skill-used", "not-skill-used"}]
+    rubric = [passed(item) for item in assertions if assertion_type(item) == "llm-rubric"]
+    if not deterministic or not activation or not rubric:
+        raise SkillEvalError("required deterministic, activation, or judge evidence is missing")
+    if containment_safety is not True:
+        raise SkillEvalError("raw benchmark safety assertion is missing")
+    return {"task": int(all(deterministic) and all(rubric)), "safety": 1,
+            "activation": int(all(activation) if activation else False), "rubric": int(all(rubric) if rubric else False)}
+
+
+def _arm_metrics(items, activation):
+    latencies = [item["latency"] for item in items]
+    task_passes, safety_passes = sum(item["task"] for item in items), sum(item["safety"] for item in items)
+    value = {"task_pass_rate": task_passes / len(items), "task_passes": task_passes, "task_total": len(items),
+             "safety_pass_rate": safety_passes / len(items), "safety_passes": safety_passes, "safety_total": len(items),
+             "median_latency_seconds": statistics.median(latencies), "latency_range_seconds": [min(latencies), max(latencies)],
+             "input_tokens": sum(item["input_tokens"] for item in items), "output_tokens": sum(item["output_tokens"] for item in items),
+             "estimated_cost_usd": sum(item["cost"] for item in items)}
+    if activation:
+        value["activation_accuracy"] = sum(item["activation"] for item in items) / len(items)
+    return value
+
+
+def _quantile(sorted_values, probability):
+    position = (len(sorted_values) - 1) * probability
+    lower, upper = int(position), min(int(position) + 1, len(sorted_values) - 1)
+    return sorted_values[lower] + (sorted_values[upper] - sorted_values[lower]) * (position - lower)
+
+
+def _number(value):
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+        raise SkillEvalError("benchmark metric must be a non-negative number")
+    return value
+
+
+def _require_digest(value, label):
+    if not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{64}", value):
+        raise SkillEvalError(f"{label} must be a sha256 digest")
+    return value
+
+
+def _validate_benchmark_provenance(provenance):
+    if not isinstance(provenance, Mapping) or set(provenance) != set(PUBLIC_PROVENANCE_KEYS):
+        raise SkillEvalError("invalid benchmark provenance")
+    validated = dict(provenance)
+    for key in ("skill_digest", "contract_digest"):
+        _require_digest(validated[key], key)
+    if validated["candidate"] != "openai:gpt-5.6-terra" or validated["judge"] != "gpt-5.6":
+        raise SkillEvalError("invalid candidate or judge provenance")
+    if validated["skill_git_revision"] != "4480393" or validated["promptfoo_version"] != "0.122.0" or validated["codex_sdk_version"] != "0.147.0":
+        raise SkillEvalError("invalid benchmark provenance")
+    return validated
+
+
+def _validate_preregistered_release_rows(rows: list[BenchmarkRow]) -> None:
+    """Apply the public benchmark's fixed IDs/sandbox only to its named skill."""
+    if rows and rows[0].skill_name == "github-public-readiness":
+        if {row.case_id for row in rows} != set(PUBLIC_CASE_IDS) or any(row.case.sandbox != "read-only" for row in rows):
+            raise SkillEvalError("benchmark release rows must use the preregistered IDs and read-only sandbox")
+
+
+def _validate_public_shape(value, shape, label):
+    if isinstance(shape, dict):
+        if not isinstance(value, Mapping):
+            raise SkillEvalError(f"{label} must be an object")
+        unknown = set(value) - set(shape)
+        if unknown:
+            raise SkillEvalError(f"{label} contains unknown field: {sorted(unknown)[0]}")
+        missing = set(shape) - set(value)
+        if missing:
+            raise SkillEvalError(f"{label} is missing field: {sorted(missing)[0]}")
+        for key, child_shape in shape.items():
+            _validate_public_shape(value[key], child_shape, f"{label}.{key}")
+        return
+    if isinstance(shape, tuple) and shape[0] is list:
+        if not isinstance(value, list):
+            raise SkillEvalError(f"{label} must be a list")
+        for index, item in enumerate(value):
+            _validate_public_shape(item, shape[1], f"{label}[{index}]")
+        return
+    if shape == _NUMBER:
+        if not isinstance(value, _NUMBER) or isinstance(value, bool):
+            raise SkillEvalError(f"{label} must be a number")
+    elif not isinstance(value, shape) or (shape is int and isinstance(value, bool)):
+        raise SkillEvalError(f"{label} has an invalid type")
+
+
+def _project_public_value(value, shape, label):
+    if isinstance(shape, dict):
+        if not isinstance(value, Mapping):
+            raise SkillEvalError(f"{label} must be an object")
+        return {key: _project_public_value(value.get(key), child_shape, f"{label}.{key}")
+                for key, child_shape in shape.items()}
+    if isinstance(shape, tuple) and shape[0] is list:
+        if not isinstance(value, list):
+            raise SkillEvalError(f"{label} must be a list")
+        return [_project_public_value(item, shape[1], f"{label}[]") for item in value]
+    return value
+
+
 def run_promptfoo(
     promptfoo_binary: Path,
     config_path: Path,
@@ -467,6 +1080,23 @@ def cleanup_staged_cases(staged_cases: list[StagedCase], run_root: Path) -> None
             _remove_staged_directory(candidate, expected_parents[label], label)
 
 
+def cleanup_benchmark_rows(rows: list[BenchmarkRow], run_root: Path) -> None:
+    """Remove only the explicit workspace and CODEX_HOME directories for benchmark rows."""
+    root = _require_directory(run_root, "run root")
+    expected_parents = {
+        "workspace": _require_directory(root / "workspaces", "workspace root"),
+        "CODEX_HOME": _require_directory(root / "codex-homes", "CODEX_HOME root"),
+    }
+    for row in rows:
+        if not isinstance(row, BenchmarkRow):
+            raise SkillEvalError("benchmark rows must contain BenchmarkRow entries")
+        for label, candidate in (
+            ("workspace", row.workspace_dir),
+            ("CODEX_HOME", row.codex_home),
+        ):
+            _remove_staged_directory(candidate, expected_parents[label], label)
+
+
 def _remove_staged_directory(candidate: Path, parent: Path, label: str) -> None:
     path = Path(candidate)
     if path.is_symlink():
@@ -511,6 +1141,79 @@ def _promptfoo_test(row: StagedCase, judge_model: str) -> dict[str, Any]:
         },
         "assert": assertions,
     }
+
+
+def _benchmark_promptfoo_test(
+    row: BenchmarkRow, judge_model: str, candidate: str, contract_digest: Optional[str] = None,
+    provenance: Optional[Mapping[str, str]] = None,
+) -> dict[str, Any]:
+    if not isinstance(row, BenchmarkRow):
+        raise SkillEvalError("benchmark rows must contain BenchmarkRow entries")
+    if row.case.case_id != row.case_id:
+        raise SkillEvalError("benchmark row does not match its contract")
+    _require_text(row.skill_name, "benchmark row skill name")
+    return {
+        "description": f"{row.arm.value} {row.case_id} repetition {row.repetition}",
+        "vars": {
+            "arm": row.arm.value,
+            "caseId": row.case_id,
+            "repetition": row.repetition,
+            "codexHome": str(row.codex_home),
+            "prompt": row.case.prompt,
+            "promptDigest": hashlib.sha256(row.case.prompt.encode("utf-8")).hexdigest(),
+            "fixtureDigest": _fixture_digest(row.baseline_hashes),
+            "sandbox": row.case.sandbox,
+            "candidate": candidate,
+            "judge": judge_model,
+            "contractDigest": contract_digest,
+            "skillRevision": (provenance or {}).get("skill_git_revision"),
+            "skillDigest": (provenance or {}).get("skill_digest"),
+            "promptfooVersion": (provenance or {}).get("promptfoo_version"),
+            "codexSdkVersion": (provenance or {}).get("codex_sdk_version"),
+            "sandboxMode": row.case.sandbox,
+            "workspaceDir": str(row.workspace_dir),
+        },
+        "assert": _benchmark_assertions(row, judge_model),
+    }
+
+
+def _fixture_digest(baseline_hashes: Mapping[str, str]) -> str:
+    encoded = json.dumps(dict(baseline_hashes), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _workspace_tree_snapshot(root: Path) -> dict[str, tuple[str, int, str]]:
+    """Capture lstat metadata without following links for post-staging containment."""
+    snapshot = {}
+    for entry in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+        relative = entry.relative_to(root).as_posix()
+        stat = entry.lstat()
+        mode = stat.st_mode & 0o7777
+        if entry.is_symlink():
+            snapshot[relative] = ["symlink", mode, os.readlink(entry)]
+        elif entry.is_dir():
+            snapshot[relative] = ["directory", mode, ""]
+        elif entry.is_file():
+            snapshot[relative] = ["file", mode, hashlib.sha256(entry.read_bytes()).hexdigest()]
+        else:
+            snapshot[relative] = ["other", mode, ""]
+    return snapshot
+
+
+def _benchmark_assertions(row: BenchmarkRow, judge_model: str) -> list[dict[str, str]]:
+    """Return output, arm-aware activation, and judge assertions for one row."""
+    activation = "not-skill-used" if row.arm is BenchmarkArm.CONTROL else (
+        "skill-used" if row.case.expected.skill_used else "not-skill-used"
+    )
+    return [
+        *[dict(assertion) for assertion in row.case.expected.output],
+        {"type": activation, "value": row.skill_name},
+        {
+            "type": "llm-rubric",
+            "value": row.case.rubric,
+            "provider": f"openai:responses:{judge_model}",
+        },
+    ]
 
 
 def _write_promptfoo_config(output_path: Path, config: Mapping[str, Any]) -> None:
