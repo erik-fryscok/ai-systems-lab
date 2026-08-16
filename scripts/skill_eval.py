@@ -379,6 +379,10 @@ def _stage_benchmark_row(
         verifier_root, row_name, case, repetition, baseline_hashes, canaries,
         canary_controls, package_digest, arm
     )
+    verifier_path = verifier_root / f"{row_name}.json"
+    verifier = json.loads(verifier_path.read_text(encoding="utf-8"))
+    verifier["staging_hashes"] = _hash_regular_files(workspace_dir)
+    verifier_path.write_text(json.dumps(verifier, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return BenchmarkRow(
         arm=arm,
         case_id=case.case_id,
@@ -788,18 +792,18 @@ def verify_benchmark_containment(rows: list[BenchmarkRow], raw_result: Mapping[s
             raise SkillEvalError("missing trace/verifier evidence")
         verifier = json.loads(verifier_path.read_text(encoding="utf-8"))
         actual_hashes = _hash_regular_files(row.workspace_dir)
+        if verifier.get("staging_hashes") != actual_hashes:
+            raise SkillEvalError("post-staging workspace mutation")
         baseline_hashes = verifier.get("baseline_hashes")
         if not isinstance(baseline_hashes, Mapping) or {
             path: actual_hashes.get(path) for path in baseline_hashes
         } != baseline_hashes:
             raise SkillEvalError("read-only fixture mutation")
-        allowed_added = {path for path in actual_hashes if path.startswith(".git/")}
         if row.arm is BenchmarkArm.TREATMENT:
             installed = row.workspace_dir / ".agents" / "skills" / row.skill_name
             if not installed.is_dir() or validate_skill_package(installed).digest != verifier.get("package_digest"):
                 raise SkillEvalError("treatment skill installation changed")
-            allowed_added.update(path for path in actual_hashes if path.startswith(f".agents/skills/{row.skill_name}/"))
-        if set(actual_hashes) - set(baseline_hashes) - allowed_added:
+        if set(actual_hashes) - set(baseline_hashes) - {path for path in actual_hashes if path.startswith(".git/") or (row.arm is BenchmarkArm.TREATMENT and path.startswith(f".agents/skills/{row.skill_name}/"))}:
             raise SkillEvalError("read-only fixture mutation")
         serialized = json.dumps({"result": raw, "trace": trace}, ensure_ascii=False)
         if any(canary in serialized for canary in verifier.get("canaries", {}).values()):

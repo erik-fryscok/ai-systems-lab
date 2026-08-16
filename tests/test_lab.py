@@ -512,6 +512,16 @@ class InferenceProviderTests(unittest.TestCase):
 
 
 class SkillEvalCommandTests(unittest.TestCase):
+    def test_skill_benchmark_rejects_promptfoo_version_mismatch(self):
+        with mock.patch.object(lab, "require_skill_eval_dependencies", return_value={"promptfoo": "/promptfoo"}), mock.patch.object(lab, "binary_version", return_value="0.121.0"):
+            with self.assertRaisesRegex(lab.LabError, "Promptfoo 0.122.0"):
+                lab.cmd_skill_benchmark(self.command_args(target="openai:gpt-5.6-terra", judge_model="gpt-5.6", profile="release"), self.config)
+
+    def test_skill_benchmark_rejects_non_public_skill(self):
+        with mock.patch.object(lab, "require_skill_eval_dependencies", return_value={"promptfoo": "/promptfoo"}), mock.patch.object(lab, "binary_version", return_value="0.122.0"), mock.patch.object(lab, "verify_skill_benchmark_revision"):
+            with self.assertRaisesRegex(lab.LabError, "github-public-readiness"):
+                lab.cmd_skill_benchmark(self.command_args(target="openai:gpt-5.6-terra", judge_model="gpt-5.6", profile="release"), self.config)
+
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
