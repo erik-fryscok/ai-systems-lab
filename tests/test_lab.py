@@ -622,6 +622,8 @@ class SkillEvalCommandTests(unittest.TestCase):
         with mock.patch.object(
             lab, "require_skill_eval_dependencies", return_value={"promptfoo": "/promptfoo"}
         ), mock.patch.object(
+            lab, "binary_version", return_value="0.122.0"
+        ), mock.patch.object(
             lab, "verify_skill_benchmark_revision"
         ) as verify_revision, mock.patch.object(
             lab, "verify_responses_endpoint"
@@ -664,6 +666,8 @@ class SkillEvalCommandTests(unittest.TestCase):
         with mock.patch.object(
             lab, "require_skill_eval_dependencies", return_value={"promptfoo": "/promptfoo"}
         ), mock.patch.object(
+            lab, "binary_version", return_value="0.122.0"
+        ), mock.patch.object(
             lab, "verify_skill_benchmark_revision"
         ), mock.patch.object(
             lab.skill_eval, "build_benchmark_promptfoo_config"
@@ -695,6 +699,8 @@ class SkillEvalCommandTests(unittest.TestCase):
             lab, "load_config", return_value=self.config
         ), mock.patch.object(
             lab, "require_skill_eval_dependencies", return_value={"promptfoo": "/private/promptfoo"}
+        ), mock.patch.object(
+            lab, "binary_version", return_value="0.122.0"
         ), mock.patch.object(
             lab, "verify_skill_benchmark_revision"
         ), mock.patch.object(
