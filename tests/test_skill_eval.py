@@ -778,6 +778,7 @@ class PromptfooConfigTests(unittest.TestCase):
 
         self.assertEqual(len(smoke_rows), 18)
         self.assertEqual(len(config["tests"]), 90)
+        self.assertEqual(config["providers"][0]["config"]["sandbox_mode"], "read-only")
         self.assertIn({"type": "not-skill-used", "value": "safe-skill"}, control["assert"])
         self.assertIn({"type": "skill-used", "value": "safe-skill"}, treatment_direct["assert"])
         self.assertIn({"type": "not-skill-used", "value": "safe-skill"}, treatment_negative["assert"])

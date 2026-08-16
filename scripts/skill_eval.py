@@ -637,7 +637,7 @@ def build_benchmark_promptfoo_config(
     provider_config: dict[str, Any] = {
         "model": target.model,
         "working_dir": "{{workspaceDir}}",
-        "sandbox_mode": "{{sandboxMode}}",
+        "sandbox_mode": "read-only",
         "approval_policy": "never",
         "enable_streaming": True,
         "deep_tracing": True,
