@@ -599,6 +599,23 @@ def require_skill_eval_dependencies():
     return dependencies
 
 
+def verify_skill_benchmark_revision(skill_dir):
+    """Require the public skill checkout to be the preregistered clean revision."""
+    try:
+        revision = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=str(skill_dir), text=True
+        ).strip()
+        changes = subprocess.check_output(
+            ["git", "status", "--porcelain"], cwd=str(skill_dir), text=True
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise LabError("skill benchmark requires a Git checkout of the tested skill") from exc
+    if revision != "44803930d9f1c5a7b3feeb4128057db744a3c7f6":
+        raise LabError("skill benchmark requires skill revision 4480393")
+    if changes:
+        raise LabError("skill benchmark requires a clean skill checkout")
+
+
 def binary_version(binary):
     if not binary:
         return None
@@ -2265,6 +2282,73 @@ def cmd_skill_redteam(args, cfg):
     _cmd_skill_run(args, cfg, redteam=True)
 
 
+def cmd_skill_benchmark(args, cfg):
+    try:
+        target = skill_eval.parse_target(args.target, cfg)
+        skill_eval.validate_judge(target, args.judge_model)
+        dependencies = require_skill_eval_dependencies()
+        if target.kind == "local":
+            model_files = model_weight_paths(cfg, target.alias)
+            missing = [path for path in model_files if not path.exists()]
+            if missing:
+                raise LabError(
+                    "Local model preflight failed; missing files:\n"
+                    + "\n".join(f"  {path}" for path in missing)
+                )
+            try:
+                verify_responses_endpoint(cfg, args.timeout)
+            except LabError:
+                raise
+            except Exception as exc:
+                raise LabError(
+                    f"Local server Responses preflight failed at {api_base(cfg)}/v1/responses: {exc}"
+                ) from exc
+
+        skill_dir = Path(args.skill_dir).expanduser()
+        verify_skill_benchmark_revision(skill_dir)
+        eval_dir = Path(args.eval_dir).expanduser() if args.eval_dir else None
+        contract = skill_eval.load_skill_contract(skill_dir, eval_dir)
+        package = skill_eval.validate_skill_package(skill_dir)
+        target_digest = hashlib.sha256(
+            f"{target.kind}:{target.model}".encode("utf-8")
+        ).hexdigest()[:8]
+        run_root = skill_eval.create_run_root(
+            paths(cfg)["state_dir"] / "skill-benchmarks",
+            f"{now_stamp()}-{contract.skill_name}-{target.kind}-{target_digest}",
+        )
+        rows = skill_eval.stage_benchmark_cases(
+            contract,
+            package,
+            skill_eval.benchmark_repetitions(args.profile),
+            run_root,
+            keep_workspaces_on_error=args.keep_workspaces,
+        )
+        config_path = run_root / "promptfooconfig.yaml"
+        raw_result_path = run_root / "promptfoo.json"
+        try:
+            skill_eval.build_benchmark_promptfoo_config(
+                target, args.judge_model, rows, args.profile, config_path
+            )
+            session = (
+                benchmark_model_session(cfg, target.alias, args.timeout)
+                if target.kind == "local"
+                else nullcontext()
+            )
+            with session:
+                skill_eval.run_promptfoo(
+                    Path(dependencies["promptfoo"]),
+                    config_path,
+                    raw_result_path,
+                    args.timeout,
+                )
+        finally:
+            if not args.keep_workspaces:
+                skill_eval.cleanup_benchmark_rows(rows, run_root)
+        print(raw_result_path)
+    except skill_eval.SkillEvalError as exc:
+        raise LabError(str(exc)) from exc
+
+
 def _cmd_skill_run(args, cfg, redteam):
     try:
         target = skill_eval.parse_target(args.target, cfg)
@@ -3536,6 +3620,15 @@ def build_parser():
     skill_redteam_parser.add_argument("--timeout", type=int, default=900)
     skill_redteam_parser.add_argument("--keep-workspaces", action="store_true")
 
+    skill_benchmark_parser = sub.add_parser("skill-benchmark")
+    skill_benchmark_parser.add_argument("skill_dir")
+    skill_benchmark_parser.add_argument("--target", required=True)
+    skill_benchmark_parser.add_argument("--judge-model", required=True)
+    skill_benchmark_parser.add_argument("--eval-dir")
+    skill_benchmark_parser.add_argument("--profile", choices=["smoke", "release"], default="smoke")
+    skill_benchmark_parser.add_argument("--timeout", type=int, default=900)
+    skill_benchmark_parser.add_argument("--keep-workspaces", action="store_true")
+
     return parser
 
 
@@ -3571,6 +3664,7 @@ COMMANDS = {
     "bench-quality": cmd_bench_quality,
     "skill-eval": cmd_skill_eval,
     "skill-redteam": cmd_skill_redteam,
+    "skill-benchmark": cmd_skill_benchmark,
     "export-public": cmd_export_public,
 }
 

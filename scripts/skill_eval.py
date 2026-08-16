@@ -556,6 +556,82 @@ def build_promptfoo_config(
     return config
 
 
+def benchmark_repetitions(profile: str) -> int:
+    """Return the preregistered repetition count for a paired benchmark profile."""
+    if profile == "smoke":
+        return 1
+    if profile == "release":
+        return 5
+    raise SkillEvalError("profile must be smoke or release")
+
+
+def build_benchmark_promptfoo_config(
+    target: TargetSpec,
+    judge_model: str,
+    rows: list[BenchmarkRow],
+    profile: str,
+    output_path: Path,
+) -> dict:
+    """Compile a no-cache Promptfoo configuration for paired benchmark rows."""
+    if not isinstance(target, TargetSpec):
+        raise SkillEvalError("target must be a TargetSpec")
+    validate_judge(target, judge_model)
+    benchmark_repetitions(profile)
+    if not isinstance(rows, list) or not rows:
+        raise SkillEvalError("benchmark rows must be a nonempty list")
+
+    provider_config: dict[str, Any] = {
+        "model": target.model,
+        "working_dir": "{{workspaceDir}}",
+        "sandbox_mode": "{{sandboxMode}}",
+        "approval_policy": "never",
+        "enable_streaming": True,
+        "deep_tracing": True,
+        "network_access_enabled": False,
+        "web_search_mode": "disabled",
+        "cli_env": {"CODEX_HOME": "{{codexHome}}"},
+    }
+    if target.alias is not None:
+        if target.context_tokens is None or target.base_url is None:
+            raise SkillEvalError("catalog target is missing Codex provider settings")
+        provider_id = "ai_systems_lab_" + re.sub(
+            r"[^a-z0-9_]+", "_", target.provider_name.lower()
+        )
+        provider_definition = {
+            "name": PROJECT_NAME,
+            "base_url": target.base_url,
+            "wire_api": "responses",
+        }
+        if target.api_key_env:
+            provider_definition["env_key"] = target.api_key_env
+        provider_config.update(
+            {
+                "model_provider": provider_id,
+                "cli_config": {
+                    "model_context_window": target.context_tokens,
+                    "model_providers": {provider_id: provider_definition},
+                },
+            }
+        )
+    elif (
+        target.provider_name != "openai-codex-sdk"
+        or target.provider_type != "openai"
+        or not target.responses_api
+    ):
+        raise SkillEvalError("unsupported target provider")
+
+    config = {
+        "description": f"Paired skill benchmark ({profile}) for {target.selector}",
+        "prompts": ["{{prompt}}"],
+        "providers": [{"id": "openai:codex-sdk", "config": provider_config}],
+        "tests": [_benchmark_promptfoo_test(row, judge_model) for row in rows],
+        "evaluateOptions": {"maxConcurrency": 1},
+        "writeLatestResults": False,
+    }
+    _write_promptfoo_config(output_path, config)
+    return config
+
+
 def run_promptfoo(
     promptfoo_binary: Path,
     config_path: Path,
@@ -608,6 +684,23 @@ def cleanup_staged_cases(staged_cases: list[StagedCase], run_root: Path) -> None
             _remove_staged_directory(candidate, expected_parents[label], label)
 
 
+def cleanup_benchmark_rows(rows: list[BenchmarkRow], run_root: Path) -> None:
+    """Remove only the explicit workspace and CODEX_HOME directories for benchmark rows."""
+    root = _require_directory(run_root, "run root")
+    expected_parents = {
+        "workspace": _require_directory(root / "workspaces", "workspace root"),
+        "CODEX_HOME": _require_directory(root / "codex-homes", "CODEX_HOME root"),
+    }
+    for row in rows:
+        if not isinstance(row, BenchmarkRow):
+            raise SkillEvalError("benchmark rows must contain BenchmarkRow entries")
+        for label, candidate in (
+            ("workspace", row.workspace_dir),
+            ("CODEX_HOME", row.codex_home),
+        ):
+            _remove_staged_directory(candidate, expected_parents[label], label)
+
+
 def _remove_staged_directory(candidate: Path, parent: Path, label: str) -> None:
     path = Path(candidate)
     if path.is_symlink():
@@ -652,6 +745,42 @@ def _promptfoo_test(row: StagedCase, judge_model: str) -> dict[str, Any]:
         },
         "assert": assertions,
     }
+
+
+def _benchmark_promptfoo_test(row: BenchmarkRow, judge_model: str) -> dict[str, Any]:
+    if not isinstance(row, BenchmarkRow):
+        raise SkillEvalError("benchmark rows must contain BenchmarkRow entries")
+    if row.case.case_id != row.case_id:
+        raise SkillEvalError("benchmark row does not match its contract")
+    _require_text(row.skill_name, "benchmark row skill name")
+    return {
+        "description": f"{row.arm.value} {row.case_id} repetition {row.repetition}",
+        "vars": {
+            "arm": row.arm.value,
+            "caseId": row.case_id,
+            "codexHome": str(row.codex_home),
+            "prompt": row.case.prompt,
+            "sandboxMode": row.case.sandbox,
+            "workspaceDir": str(row.workspace_dir),
+        },
+        "assert": _benchmark_assertions(row, judge_model),
+    }
+
+
+def _benchmark_assertions(row: BenchmarkRow, judge_model: str) -> list[dict[str, str]]:
+    """Return output, arm-aware activation, and judge assertions for one row."""
+    activation = "not-skill-used" if row.arm is BenchmarkArm.CONTROL else (
+        "skill-used" if row.case.expected.skill_used else "not-skill-used"
+    )
+    return [
+        *[dict(assertion) for assertion in row.case.expected.output],
+        {"type": activation, "value": row.skill_name},
+        {
+            "type": "llm-rubric",
+            "value": row.case.rubric,
+            "provider": f"openai:responses:{judge_model}",
+        },
+    ]
 
 
 def _write_promptfoo_config(output_path: Path, config: Mapping[str, Any]) -> None:

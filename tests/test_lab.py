@@ -586,11 +586,50 @@ class SkillEvalCommandTests(unittest.TestCase):
                 "deep",
             ]
         )
+        benchmark_args = lab.build_parser().parse_args(
+            [
+                "skill-benchmark",
+                "skill-dir",
+                "--target",
+                "openai:gpt-5.6-terra",
+                "--judge-model",
+                "gpt-5.6",
+                "--profile",
+                "release",
+            ]
+        )
 
         self.assertEqual(eval_args.profile, "smoke")
         self.assertEqual(eval_args.timeout, 900)
         self.assertFalse(eval_args.keep_workspaces)
         self.assertEqual(redteam_args.profile, "deep")
+        self.assertEqual(benchmark_args.profile, "release")
+        self.assertEqual(benchmark_args.timeout, 900)
+        self.assertFalse(benchmark_args.keep_workspaces)
+
+    def test_successful_cloud_benchmark_skips_local_lifecycle_and_cleans_paired_staging(self):
+        with mock.patch.object(
+            lab, "require_skill_eval_dependencies", return_value={"promptfoo": "/promptfoo"}
+        ), mock.patch.object(
+            lab, "verify_skill_benchmark_revision"
+        ) as verify_revision, mock.patch.object(
+            lab, "verify_responses_endpoint"
+        ) as verify_responses, mock.patch.object(
+            lab, "benchmark_model_session"
+        ) as benchmark_session, mock.patch.object(
+            lab.skill_eval, "run_promptfoo"
+        ) as run_promptfoo, redirect_stdout(io.StringIO()):
+            lab.cmd_skill_benchmark(
+                self.command_args(target="openai:gpt-5.6-terra", judge_model="gpt-5.6"),
+                self.config,
+            )
+
+        run_root = run_promptfoo.call_args.args[1].parent
+        verify_revision.assert_called_once_with(self.skill_dir)
+        verify_responses.assert_not_called()
+        benchmark_session.assert_not_called()
+        self.assertEqual(list((run_root / "workspaces").iterdir()), [])
+        self.assertEqual(list((run_root / "codex-homes").iterdir()), [])
 
     def test_skill_eval_rejects_an_invalid_target_before_dependency_or_inference_checks(self):
         args = Namespace(

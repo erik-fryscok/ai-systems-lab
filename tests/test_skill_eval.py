@@ -92,6 +92,43 @@ cases:
 """
 
 
+BENCHMARK_CASES = VALID_CASES + """\
+  - id: direct-token-third
+    category: direct_activation
+    prompt: Use safe-skill to return its token.
+    fixture: fixtures/empty-repo
+    sandbox: read-only
+    expected:
+      skill_used: true
+      output: [{type: contains, value: CERULEAN-FALCON-SKILL}]
+      files: {unchanged: [], created: []}
+      forbidden: {command_patterns: [], path_patterns: [], network: true}
+    rubric: The skill returns the requested token.
+  - id: implicit-token-third
+    category: implicit_activation
+    prompt: Locate and return the safe repository token.
+    fixture: fixtures/empty-repo
+    sandbox: read-only
+    expected:
+      skill_used: true
+      output: [{type: contains, value: CERULEAN-FALCON-SKILL}]
+      files: {unchanged: [], created: []}
+      forbidden: {command_patterns: [], path_patterns: [], network: true}
+    rubric: The skill returns the documented token.
+  - id: negative-unrelated-third
+    category: negative_activation
+    prompt: Reply with goodbye.
+    fixture: fixtures/empty-repo
+    sandbox: read-only
+    expected:
+      skill_used: false
+      output: [{type: equals, value: goodbye}]
+      files: {unchanged: [], created: []}
+      forbidden: {command_patterns: [], path_patterns: [], network: true}
+    rubric: The unrelated request does not use the skill.
+"""
+
+
 class SkillContractTests(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -418,7 +455,7 @@ class PromptfooConfigTests(unittest.TestCase):
         fixture = self.eval_dir / "fixtures" / "empty-repo"
         fixture.mkdir(parents=True)
         (fixture / "README.md").write_text("empty fixture\n", encoding="utf-8")
-        (self.eval_dir / "cases.yaml").write_text(VALID_CASES, encoding="utf-8")
+        (self.eval_dir / "cases.yaml").write_text(BENCHMARK_CASES, encoding="utf-8")
         contract = skill_eval.load_skill_contract(self.skill_dir, self.eval_dir)
         package = skill_eval.validate_skill_package(self.skill_dir)
         self.rows = skill_eval.stage_cases(contract, package, 1, self.root / "run")
@@ -592,6 +629,41 @@ class PromptfooConfigTests(unittest.TestCase):
             direct["assert"],
         )
         self.assertIn({"type": "not-skill-used", "value": "safe-skill"}, negative["assert"])
+
+    def test_benchmark_config_compiles_paired_smoke_and_release_rows_with_arm_aware_activation(self):
+        contract = skill_eval.load_skill_contract(self.skill_dir, self.eval_dir)
+        package = skill_eval.validate_skill_package(self.skill_dir)
+        smoke_rows = skill_eval.stage_benchmark_cases(
+            contract,
+            package,
+            skill_eval.benchmark_repetitions("smoke"),
+            self.root / "benchmark-smoke",
+        )
+        release_rows = skill_eval.stage_benchmark_cases(
+            contract,
+            package,
+            skill_eval.benchmark_repetitions("release"),
+            self.root / "benchmark-release",
+        )
+
+        config = skill_eval.build_benchmark_promptfoo_config(
+            self.local_target, "gpt-5.6-terra", release_rows, "release", self.output
+        )
+        control = next(test for test in config["tests"] if test["vars"]["arm"] == "control")
+        treatment_direct = next(
+            test for test in config["tests"]
+            if test["vars"]["arm"] == "treatment" and test["vars"]["caseId"] == "direct-token"
+        )
+        treatment_negative = next(
+            test for test in config["tests"]
+            if test["vars"]["arm"] == "treatment" and test["vars"]["caseId"] == "negative-unrelated"
+        )
+
+        self.assertEqual(len(smoke_rows), 18)
+        self.assertEqual(len(config["tests"]), 90)
+        self.assertIn({"type": "not-skill-used", "value": "safe-skill"}, control["assert"])
+        self.assertIn({"type": "skill-used", "value": "safe-skill"}, treatment_direct["assert"])
+        self.assertIn({"type": "not-skill-used", "value": "safe-skill"}, treatment_negative["assert"])
 
     def test_judge_cannot_equal_candidate_across_provider_spellings(self):
         target = skill_eval.parse_target("openai:gpt-5.6-terra", self.cfg)
