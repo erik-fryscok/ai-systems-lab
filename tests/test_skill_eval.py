@@ -1,4 +1,5 @@
 import importlib.util
+import hashlib
 import json
 import subprocess
 import tempfile
@@ -796,8 +797,8 @@ class SkillBenchmarkSummaryTests(unittest.TestCase):
     def raw_result(self, rows=None):
         return {"results": [{
             "vars": {"arm": row.arm.value, "caseId": row.case_id,
-                     "repetition": row.repetition, "promptDigest": "b" * 64,
-                     "fixtureDigest": "c" * 64, "sandbox": row.case.sandbox,
+                     "repetition": row.repetition, "promptDigest": hashlib.sha256(row.case.prompt.encode()).hexdigest(),
+                     "fixtureDigest": skill_eval._fixture_digest(row.baseline_hashes), "sandbox": row.case.sandbox,
                      "candidate": self.provenance["candidate"], "judge": self.provenance["judge"],
                      "contractDigest": self.provenance["contract_digest"], "skillRevision": self.provenance["skill_git_revision"],
                      "skillDigest": self.provenance["skill_digest"], "promptfooVersion": self.provenance["promptfoo_version"],
@@ -844,6 +845,24 @@ class SkillBenchmarkSummaryTests(unittest.TestCase):
         summary = skill_eval.summarize_benchmark(self.rows, raw, self.provenance)
         self.assertEqual(summary["metrics"]["control"]["safety_passes"], 45)
         self.assertEqual(summary["metrics"]["treatment"]["safety_total"], 45)
+
+    def test_parses_promptfoo_component_results_and_correlated_traces(self):
+        raw = self.raw_result()
+        traces = {}
+        for index, result in enumerate(raw["results"]):
+            result["testCase"] = {"vars": result.pop("vars")}
+            result["gradingResult"] = {"pass": True, "componentResults": [
+                {"pass": True, "assertion": {"type": "contains"}},
+                {"pass": True, "assertion": {"type": "skill-used"}},
+                {"pass": True, "assertion": {"type": "llm-rubric"}},
+            ]}
+            result.pop("assertions")
+            result["traceId"] = f"trace-{index}"
+            result.pop("trace")
+            traces[result["traceId"]] = {"spans": [{"name": "codex.run", "attributes": {"network": False}}]}
+        raw["traces"] = traces
+        skill_eval.verify_benchmark_containment(self.rows, raw, self.root / "run")
+        self.assertEqual(skill_eval.summarize_benchmark(self.rows, raw, self.provenance)["run"]["valid_pairs"], 45)
 
     def test_containment_rejects_missing_verifier(self):
         (self.root / "run" / "verifiers" / "direct-token-1-control.json").unlink()

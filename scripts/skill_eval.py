@@ -782,7 +782,8 @@ def verify_benchmark_containment(rows: list[BenchmarkRow], raw_result: Mapping[s
         verifier_path = Path(run_root) / "verifiers" / f"{row.case_id}-{row.repetition}-{row.arm.value}.json"
         if raw is None or not verifier_path.is_file():
             raise SkillEvalError("missing trace/verifier evidence")
-        if not raw.get("trace"):
+        trace = _promptfoo_trace(raw_result, raw)
+        if not trace:
             raise SkillEvalError("missing trace/verifier evidence")
         verifier = json.loads(verifier_path.read_text(encoding="utf-8"))
         actual_hashes = _hash_regular_files(row.workspace_dir)
@@ -794,10 +795,23 @@ def verify_benchmark_containment(rows: list[BenchmarkRow], raw_result: Mapping[s
         serialized = json.dumps(raw, ensure_ascii=False)
         if any(canary in serialized for canary in verifier.get("canaries", {}).values()):
             raise SkillEvalError("canary leakage")
-        trace = json.dumps(raw.get("trace"), ensure_ascii=False).lower()
-        if '"network": true' in trace or '"forbidden_command": true' in trace:
+        trace_text = json.dumps(trace, ensure_ascii=False).lower()
+        if any(marker in trace_text for marker in ('"network": true', '"forbidden_command": true', 'web_search', 'network_access', 'shell_command', 'terminal.command')):
             raise SkillEvalError("forbidden command/network")
         raw["_containment_safety"] = True
+
+
+def _promptfoo_trace(raw_result: Mapping[str, Any], raw: Mapping[str, Any]) -> Any:
+    """Resolve Promptfoo 0.122 result trace linkage without retaining trace content."""
+    if raw.get("trace"):
+        return raw["trace"]  # compatibility with focused synthetic fixtures
+    trace_id = raw.get("traceId") or (raw.get("metadata") or {}).get("traceId")
+    traces = raw_result.get("traces")
+    if isinstance(traces, Mapping):
+        return traces.get(trace_id)
+    if isinstance(traces, list):
+        return next((trace for trace in traces if isinstance(trace, Mapping) and trace.get("traceId") == trace_id), None)
+    return None
 
 
 def validate_benchmark_public_result(payload: Mapping[str, Any]) -> None:
@@ -871,10 +885,16 @@ def _parse_benchmark_observations(rows, raw_result, provenance):
                 raise SkillEvalError(f"mismatched {label} provenance")
         prompt_digest = _require_digest(vars.get("promptDigest"), "prompt digest")
         fixture_digest = _require_digest(vars.get("fixtureDigest"), "fixture digest")
-        assertions = raw.get("assertions")
+        if prompt_digest != hashlib.sha256(row.case.prompt.encode("utf-8")).hexdigest() or fixture_digest != _fixture_digest(row.baseline_hashes):
+            raise SkillEvalError("mismatched local prompt or fixture digest")
+        grading = raw.get("gradingResult") if isinstance(raw.get("gradingResult"), Mapping) else {}
+        assertions = grading.get("componentResults") if isinstance(grading.get("componentResults"), list) else raw.get("assertions")
         if not isinstance(assertions, list):
             raise SkillEvalError("raw benchmark assertions are missing")
-        outcomes = _assertion_outcomes(assertions, bool(raw.get("success")), raw.get("_containment_safety"))
+        response = raw.get("response") if isinstance(raw.get("response"), Mapping) else {}
+        if response.get("error") or raw.get("error") or not isinstance(response.get("output", raw.get("output")), str) or not response.get("output", raw.get("output")).strip():
+            raise SkillEvalError("candidate/judge error or empty response")
+        outcomes = _assertion_outcomes(assertions, bool(raw.get("success", raw.get("pass", grading.get("pass", False)))), raw.get("_containment_safety"))
         usage = raw.get("tokenUsage") if isinstance(raw.get("tokenUsage"), Mapping) else {}
         observations.append({"arm": row.arm.value, "case_id": row.case_id, "repetition": row.repetition,
                              "prompt_digest": prompt_digest, "fixture_digest": fixture_digest, "sandbox": row.case.sandbox,
@@ -887,10 +907,15 @@ def _parse_benchmark_observations(rows, raw_result, provenance):
 
 
 def _assertion_outcomes(assertions, success, containment_safety=None):
+    def assertion_type(item):
+        assertion = item.get("assertion") if isinstance(item, Mapping) else None
+        return assertion.get("type") if isinstance(assertion, Mapping) else item.get("type")
     passed = lambda item: bool(item.get("pass", item.get("success", False))) if isinstance(item, Mapping) else False
-    deterministic = [passed(item) for item in assertions if item.get("type") in DETERMINISTIC_ASSERTION_TYPES]
-    activation = [passed(item) for item in assertions if item.get("type") in {"skill-used", "not-skill-used"}]
-    rubric = [passed(item) for item in assertions if item.get("type") == "llm-rubric"]
+    deterministic = [passed(item) for item in assertions if assertion_type(item) in DETERMINISTIC_ASSERTION_TYPES]
+    activation = [passed(item) for item in assertions if assertion_type(item) in {"skill-used", "not-skill-used"}]
+    rubric = [passed(item) for item in assertions if assertion_type(item) == "llm-rubric"]
+    if not deterministic or not activation or not rubric:
+        raise SkillEvalError("required deterministic, activation, or judge evidence is missing")
     if containment_safety is not True:
         raise SkillEvalError("raw benchmark safety assertion is missing")
     return {"task": int(success and all(deterministic) and all(rubric)), "safety": 1,
