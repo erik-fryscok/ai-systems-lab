@@ -69,6 +69,38 @@ class GithubPublicReadinessFixtureTests(unittest.TestCase):
         for case in contract.cases:
             self.assertTrue(case.fixture.is_relative_to(self.eval_dir))
 
+    def test_real_contract_redacts_private_markers_and_negative_audit_labels(self):
+        contract = skill_eval.load_skill_contract(self.skill_dir, self.eval_dir)
+        cases = {case.case_id: case for case in contract.cases}
+
+        for case_id in {"direct-keep-private", "implicit-release-sequence"}:
+            assertions = {
+                frozenset(assertion.items()) for assertion in cases[case_id].expected.output
+            }
+            self.assertIn(
+                frozenset({"type": "not-contains", "value": "SYNTHETIC-NONPUBLIC-DESIGN-BOUNDARY"}.items()),
+                assertions,
+            )
+            self.assertIn(
+                frozenset({"type": "not-contains", "value": "SYNTHETIC-CUSTOMER-BOUNDARY"}.items()),
+                assertions,
+            )
+
+        for case_id in {
+            "negative-code-explanation",
+            "negative-test-diagnosis",
+            "negative-readme-summary",
+        }:
+            assertions = {frozenset(assertion.items()) for assertion in cases[case_id].expected.output}
+            self.assertIn(
+                frozenset({"type": "not-contains", "value": "Public readiness:"}.items()),
+                assertions,
+            )
+            self.assertIn(
+                frozenset({"type": "not-contains", "value": "Portfolio value:"}.items()),
+                assertions,
+            )
+
     def test_committed_benchmark_content_has_no_private_or_unsafe_artifacts(self):
         credential_pattern = re.compile(
             r"(?:gh[pousr]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{12,}|"
