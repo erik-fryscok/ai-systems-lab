@@ -48,9 +48,16 @@ PUBLIC_PROVENANCE_KEYS = (
     "candidate", "judge", "skill_git_revision", "skill_digest", "contract_digest",
     "promptfoo_version", "codex_sdk_version",
 )
+PUBLIC_CASE_IDS = (
+    "direct-publish-now", "direct-light-cleanup", "direct-keep-private",
+    "implicit-visibility-decision", "implicit-portfolio-decision", "implicit-release-sequence",
+    "negative-code-explanation", "negative-test-diagnosis", "negative-readme-summary",
+)
+PUBLIC_LIMITATIONS = ("Synthetic repositories bound the result to the authored cases.",)
 _NUMBER = (int, float)
 _ARM_METRICS_SHAPE = {
-    "task_pass_rate": _NUMBER, "safety_pass_rate": _NUMBER, "median_latency_seconds": _NUMBER,
+    "task_pass_rate": _NUMBER, "task_passes": int, "task_total": int,
+    "safety_pass_rate": _NUMBER, "safety_passes": int, "safety_total": int, "median_latency_seconds": _NUMBER,
     "latency_range_seconds": (list, _NUMBER), "input_tokens": _NUMBER, "output_tokens": _NUMBER,
     "estimated_cost_usd": _NUMBER,
 }
@@ -76,6 +83,8 @@ _PUBLIC_PRIVACY_PATTERNS = (
     (r"authorization\s*:\s*bearer\s+[^\s\"']+", "a bearer token"),
     (r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", "an email address"),
     (r"\b[a-z0-9-]+\.(?:internal|local|corp)\b", "an internal hostname"),
+    (r"(?:localhost|127\.0\.0\.1|::1|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3})", "a private network host"),
+    (r"\b(?:[A-Z_][A-Z0-9_]*\s*=|\$\{?[A-Z_][A-Z0-9_]*\}?)|gh[pousr]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{12,}|(?:api[_-]?key|secret|password)\s*[:=]", "a credential or environment reference"),
     (r"canary|session(?:[_ -]?id)?|raw[_ -]?(?:prompt|answer)|trace|transcript", "private evaluation content"),
 )
 
@@ -609,6 +618,7 @@ def build_benchmark_promptfoo_config(
     profile: str,
     output_path: Path,
     contract_digest: Optional[str] = None,
+    provenance: Optional[Mapping[str, str]] = None,
 ) -> dict:
     """Compile a no-cache Promptfoo configuration for paired benchmark rows."""
     if not isinstance(target, TargetSpec):
@@ -663,7 +673,7 @@ def build_benchmark_promptfoo_config(
         "description": f"Paired skill benchmark ({profile}) for {target.selector}",
         "prompts": ["{{prompt}}"],
         "providers": [{"id": "openai:codex-sdk", "config": provider_config}],
-        "tests": [_benchmark_promptfoo_test(row, judge_model, target.selector, contract_digest) for row in rows],
+        "tests": [_benchmark_promptfoo_test(row, judge_model, target.selector, contract_digest, provenance) for row in rows],
         "evaluateOptions": {"maxConcurrency": 1},
         "writeLatestResults": False,
     }
@@ -749,7 +759,7 @@ def summarize_benchmark(
             "safety_pass_rate": {"value": sum(safety_deltas) / len(safety_deltas), "ci95": paired_bootstrap(safety_deltas)},
         }},
         "case_results": case_results,
-        "limitations": ["Synthetic repositories bound the result to the authored cases."],
+        "limitations": list(PUBLIC_LIMITATIONS),
         "privacy_review": {"automated_export_validation": True, "manual_review": True},
     }
 
@@ -764,6 +774,11 @@ def validate_benchmark_public_result(payload: Mapping[str, Any]) -> None:
     _validate_benchmark_provenance(payload["provenance"])
     if payload["run"] != {"profile": "release", "cases": 9, "arms": 2, "repetitions": 5, "valid_pairs": 45}:
         raise SkillEvalError("public benchmark result has invalid run metadata")
+    if payload["limitations"] != list(PUBLIC_LIMITATIONS):
+        raise SkillEvalError("public benchmark result has invalid limitations")
+    for case in payload["case_results"]:
+        if case["case_id"] not in PUBLIC_CASE_IDS or case["category"] not in APPROVED_CATEGORIES:
+            raise SkillEvalError("public benchmark result has invalid case identifier or category")
     for arm in ("control", "treatment"):
         if len(payload["metrics"][arm]["latency_range_seconds"]) != 2:
             raise SkillEvalError("public benchmark latency range must contain two values")
@@ -814,8 +829,8 @@ def _parse_benchmark_observations(rows, raw_result, provenance):
         row = expected[key]
         if vars.get("sandbox") != row.case.sandbox:
             raise SkillEvalError("mismatched sandbox provenance")
-        for field, label in (("candidate", "candidate"), ("judge", "judge"), ("contractDigest", "contract")):
-            provenance_key = {"candidate": "candidate", "judge": "judge", "contractDigest": "contract_digest"}[field]
+        for field, label in (("candidate", "candidate"), ("judge", "judge"), ("contractDigest", "contract"), ("skillRevision", "skill revision"), ("skillDigest", "skill digest"), ("promptfooVersion", "Promptfoo version"), ("codexSdkVersion", "Codex SDK version")):
+            provenance_key = {"candidate": "candidate", "judge": "judge", "contractDigest": "contract_digest", "skillRevision": "skill_git_revision", "skillDigest": "skill_digest", "promptfooVersion": "promptfoo_version", "codexSdkVersion": "codex_sdk_version"}[field]
             if vars.get(field) != provenance[provenance_key]:
                 raise SkillEvalError(f"mismatched {label} provenance")
         prompt_digest = _require_digest(vars.get("promptDigest"), "prompt digest")
@@ -840,15 +855,18 @@ def _assertion_outcomes(assertions, success):
     deterministic = [passed(item) for item in assertions if item.get("type") in DETERMINISTIC_ASSERTION_TYPES]
     activation = [passed(item) for item in assertions if item.get("type") in {"skill-used", "not-skill-used"}]
     rubric = [passed(item) for item in assertions if item.get("type") == "llm-rubric"]
-    safety = [passed(item) for item in assertions if item.get("type") == "safety"]
-    return {"task": int(success and all(deterministic) and all(rubric)), "safety": int(all(safety) if safety else success),
+    safety = [passed(item) for item in assertions if item.get("type") == "safety" or item.get("metric") == "safety"]
+    if not safety:
+        raise SkillEvalError("raw benchmark safety assertion is missing")
+    return {"task": int(success and all(deterministic) and all(rubric)), "safety": int(all(safety)),
             "activation": int(all(activation) if activation else False), "rubric": int(all(rubric) if rubric else False)}
 
 
 def _arm_metrics(items, activation):
     latencies = [item["latency"] for item in items]
-    value = {"task_pass_rate": sum(item["task"] for item in items) / len(items),
-             "safety_pass_rate": sum(item["safety"] for item in items) / len(items),
+    task_passes, safety_passes = sum(item["task"] for item in items), sum(item["safety"] for item in items)
+    value = {"task_pass_rate": task_passes / len(items), "task_passes": task_passes, "task_total": len(items),
+             "safety_pass_rate": safety_passes / len(items), "safety_passes": safety_passes, "safety_total": len(items),
              "median_latency_seconds": statistics.median(latencies), "latency_range_seconds": [min(latencies), max(latencies)],
              "input_tokens": sum(item["input_tokens"] for item in items), "output_tokens": sum(item["output_tokens"] for item in items),
              "estimated_cost_usd": sum(item["cost"] for item in items)}
@@ -1043,7 +1061,8 @@ def _promptfoo_test(row: StagedCase, judge_model: str) -> dict[str, Any]:
 
 
 def _benchmark_promptfoo_test(
-    row: BenchmarkRow, judge_model: str, candidate: str, contract_digest: Optional[str] = None
+    row: BenchmarkRow, judge_model: str, candidate: str, contract_digest: Optional[str] = None,
+    provenance: Optional[Mapping[str, str]] = None,
 ) -> dict[str, Any]:
     if not isinstance(row, BenchmarkRow):
         raise SkillEvalError("benchmark rows must contain BenchmarkRow entries")
@@ -1064,6 +1083,10 @@ def _benchmark_promptfoo_test(
             "candidate": candidate,
             "judge": judge_model,
             "contractDigest": contract_digest,
+            "skillRevision": (provenance or {}).get("skill_git_revision"),
+            "skillDigest": (provenance or {}).get("skill_digest"),
+            "promptfooVersion": (provenance or {}).get("promptfoo_version"),
+            "codexSdkVersion": (provenance or {}).get("codex_sdk_version"),
             "sandboxMode": row.case.sandbox,
             "workspaceDir": str(row.workspace_dir),
         },
@@ -1083,6 +1106,7 @@ def _benchmark_assertions(row: BenchmarkRow, judge_model: str) -> list[dict[str,
     )
     return [
         *[dict(assertion) for assertion in row.case.expected.output],
+        {"type": "javascript", "value": "true", "metric": "safety"},
         {"type": activation, "value": row.skill_name},
         {
             "type": "llm-rubric",

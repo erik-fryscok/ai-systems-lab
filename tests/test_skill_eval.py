@@ -798,10 +798,12 @@ class SkillBenchmarkSummaryTests(unittest.TestCase):
                      "repetition": row.repetition, "promptDigest": "b" * 64,
                      "fixtureDigest": "c" * 64, "sandbox": row.case.sandbox,
                      "candidate": self.provenance["candidate"], "judge": self.provenance["judge"],
-                     "contractDigest": self.provenance["contract_digest"]},
+                     "contractDigest": self.provenance["contract_digest"], "skillRevision": self.provenance["skill_git_revision"],
+                     "skillDigest": self.provenance["skill_digest"], "promptfooVersion": self.provenance["promptfoo_version"],
+                     "codexSdkVersion": self.provenance["codex_sdk_version"]},
             "success": True, "assertions": [
                 {"type": "contains", "pass": True}, {"type": "skill-used", "pass": True},
-                {"type": "llm-rubric", "pass": True}, {"type": "safety", "pass": True},
+                {"type": "llm-rubric", "pass": True}, {"type": "safety", "pass": True, "metric": "safety"},
             ], "latencyMs": 1000, "tokenUsage": {"prompt": 10, "completion": 5}, "cost": 0.01,
             "output": "must never reach a summary",
         } for row in (rows or self.rows)]}
@@ -846,6 +848,15 @@ class SkillBenchmarkSummaryTests(unittest.TestCase):
     def test_public_result_rejects_sensitive_values_in_allowed_fields(self):
         summary = skill_eval.summarize_benchmark(self.rows, self.raw_result(), self.provenance)
         for value in ("/Users/example/private", "Authorization: Bearer secret", "person@example.com", "runner.internal", "canary-token", "raw answer", "trace transcript"):
+            with self.subTest(value=value):
+                payload = dict(summary)
+                payload["limitations"] = [value]
+                with self.assertRaises(skill_eval.SkillEvalError):
+                    skill_eval.validate_benchmark_public_result(payload)
+
+    def test_public_result_rejects_env_tokens_private_hosts_and_freeform_case_data(self):
+        summary = skill_eval.summarize_benchmark(self.rows, self.raw_result(), self.provenance)
+        for value in ("TOKEN=secret", "${HOME}", "ghp_abcdefghijklmnop", "http://127.0.0.1", "confidential notes"):
             with self.subTest(value=value):
                 payload = dict(summary)
                 payload["limitations"] = [value]

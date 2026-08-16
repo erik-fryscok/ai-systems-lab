@@ -2344,7 +2344,7 @@ def cmd_skill_benchmark(args, cfg):
         }
         try:
             skill_eval.build_benchmark_promptfoo_config(
-                target, args.judge_model, rows, args.profile, config_path, contract_digest
+                target, args.judge_model, rows, args.profile, config_path, contract_digest, provenance
             )
             session = (
                 benchmark_model_session(cfg, target.alias, args.timeout)
@@ -3504,6 +3504,10 @@ def cmd_export_benchmark_public(args, cfg):
         raise LabError("Completed private benchmark run does not contain benchmark-summary.json")
     output_path = Path(args.output).expanduser().resolve()
     try:
+        schema_path = REPO_ROOT / "docs" / "benchmark-results" / "github-public-readiness-benchmark.schema.json"
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        if schema.get("$schema") != "https://json-schema.org/draft/2020-12/schema" or schema.get("additionalProperties") is not False:
+            raise LabError("Public benchmark schema is invalid")
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
         public_result = skill_eval.project_benchmark_public_result(summary)
     except (OSError, json.JSONDecodeError, skill_eval.SkillEvalError) as exc:
